@@ -32,6 +32,10 @@ func (p *policyWatcher) onUpsert(
 
 	oldCNP, ok := p.cnpCache[key]
 	if ok {
+		// no generation change; this was a status update.
+		if oldCNP.Generation == cnp.Generation {
+			return nil
+		}
 		if oldCNP.DeepEqual(cnp) {
 			return nil
 		}
@@ -64,7 +68,14 @@ func (p *policyWatcher) onUpsert(
 	if hasToServices(cnp) {
 		p.toServicesPolicies[key] = struct{}{}
 	} else {
-		delete(p.toServicesPolicies, key)
+		if _, hadToServices := p.toServicesPolicies[key]; hadToServices {
+			// transitioning from with toServices to without toServices
+			delete(p.toServicesPolicies, key)
+			// Clear ToServices index
+			for svcID := range p.cnpByServiceID {
+				p.clearCNPForService(key, svcID)
+			}
+		}
 	}
 
 	return p.resolveCiliumNetworkPolicyRefs(cnp, key, initialRecvTime, resourceID)
@@ -116,7 +127,9 @@ func (p *policyWatcher) resolveCiliumNetworkPolicyRefs(
 	metrics.CIDRGroupTranslationTimeStats.Observe(time.Since(translationStart).Seconds())
 
 	// Resolve ToService references
-	p.resolveToServices(key, translatedCNP)
+	if _, exists := p.toServicesPolicies[key]; exists {
+		p.resolveToServices(key, translatedCNP)
+	}
 
 	err := p.upsertCiliumNetworkPolicyV2(translatedCNP, initialRecvTime, resourceID)
 	if err == nil {
@@ -138,10 +151,10 @@ func (p *policyWatcher) upsertCiliumNetworkPolicyV2(cnp *types.SlimCNP, initialR
 	rules, policyImportErr := cnp.Parse()
 	if policyImportErr == nil {
 		_, policyImportErr = p.policyManager.PolicyAdd(rules, &policy.AddOptions{
-			ReplaceWithLabels:   cnp.GetIdentityLabels(),
 			Source:              source.CustomResource,
 			ProcessingStartTime: initialRecvTime,
 			Resource:            resourceID,
+			ReplaceByResource:   true,
 		})
 	}
 
@@ -163,9 +176,10 @@ func (p *policyWatcher) deleteCiliumNetworkPolicyV2(cnp *types.SlimCNP, resource
 
 	scopedLog.Debug("Deleting CiliumNetworkPolicy")
 
-	_, err := p.policyManager.PolicyDelete(cnp.GetIdentityLabels(), &policy.DeleteOptions{
-		Source:   source.CustomResource,
-		Resource: resourceID,
+	_, err := p.policyManager.PolicyDelete(nil, &policy.DeleteOptions{
+		Source:           source.CustomResource,
+		Resource:         resourceID,
+		DeleteByResource: true,
 	})
 	if err == nil {
 		scopedLog.Info("Deleted CiliumNetworkPolicy")

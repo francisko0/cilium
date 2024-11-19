@@ -6,23 +6,23 @@ package bandwidth
 import (
 	"context"
 	"fmt"
-
-	"github.com/sirupsen/logrus"
-	"github.com/vishvananda/netlink"
+	"log/slog"
 
 	"github.com/cilium/statedb"
 	"github.com/cilium/statedb/reconciler"
+	"github.com/vishvananda/netlink"
 
+	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/datapath/types"
 )
 
 type ops struct {
-	log       logrus.FieldLogger
+	log       *slog.Logger
 	isEnabled func() bool
 }
 
-func newOps(log logrus.FieldLogger, mgr types.BandwidthManager) reconciler.Operations[*tables.BandwidthQDisc] {
+func newOps(log *slog.Logger, mgr types.BandwidthManager) reconciler.Operations[*tables.BandwidthQDisc] {
 	return &ops{log, mgr.Enabled}
 }
 
@@ -53,23 +53,40 @@ func (ops *ops) Update(ctx context.Context, txn statedb.ReadTxn, q *tables.Bandw
 	device := link.Attrs().Name
 
 	// Check if the qdiscs are already set up as expected.
-	qdiscs, err := netlink.QdiscList(link)
+	qdiscs, err := safenetlink.QdiscList(link)
 	if err != nil {
 		return fmt.Errorf("QdiscList: %w", err)
 	}
-	if len(qdiscs) > 0 {
-		ok := qdiscs[0].Type() == "mq"
-		if qdiscs[0].Type() == "fq" {
-			fq, _ := qdiscs[0].(*netlink.Fq)
+	updatedQdiscs := 0
+	// Update numEgressQdiscs to only include egress qdiscs while iterating
+	numEgressQdiscs := len(qdiscs)
+	for _, qdisc := range qdiscs {
+		switch qdisc.Attrs().Parent {
+		// Update egress qdisc count by excluding clsact and ingress qdiscs.
+		// clsact and ingress have the same handle.
+		case netlink.HANDLE_CLSACT:
+			numEgressQdiscs--
+		case netlink.HANDLE_ROOT:
+			if qdisc.Type() == "mq" {
+				updatedQdiscs++
+			}
+		default:
+			if qdisc.Type() == "fq" {
+				fq, _ := qdisc.(*netlink.Fq)
 
-			// If it's "fq" and with our parameters, then assume this was
-			// already set up and there wasn't any MQ support.
-			ok = fq.Horizon == uint32(q.FqHorizon.Microseconds()) &&
-				fq.Buckets == q.FqBuckets
+				// If it's "fq" and with our parameters, then assume this was
+				// already set up and there wasn't any MQ support.
+				ok := fq.Horizon == uint32(q.FqHorizon.Microseconds()) &&
+					fq.Buckets == q.FqBuckets
+				if ok {
+					updatedQdiscs++
+				}
+			}
+
 		}
-		if ok {
-			return nil
-		}
+	}
+	if updatedQdiscs == numEgressQdiscs {
+		return nil
 	}
 
 	// We strictly want to avoid a down/up cycle on the device at
@@ -110,10 +127,10 @@ func (ops *ops) Update(ctx context.Context, txn statedb.ReadTxn, q *tables.Bandw
 		}
 		which = "fq"
 	}
-	ops.log.WithField("device", device).Infof("Setting qdisc to %s", which)
+	ops.log.Info("Setting qdisc", "qdisc", which, "device", device)
 
 	// Set the fq parameters
-	qdiscs, err = netlink.QdiscList(link)
+	qdiscs, err = safenetlink.QdiscList(link)
 	if err != nil {
 		return fmt.Errorf("QdiscList: %w", err)
 	}

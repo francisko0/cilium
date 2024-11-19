@@ -19,7 +19,11 @@ import (
 	"github.com/cilium/cilium/pkg/endpoint"
 	endpointid "github.com/cilium/cilium/pkg/endpoint/id"
 	"github.com/cilium/cilium/pkg/fqdn/restore"
+	"github.com/cilium/cilium/pkg/labels"
+	"github.com/cilium/cilium/pkg/labelsfilter"
 	monitorAPI "github.com/cilium/cilium/pkg/monitor/api"
+	"github.com/cilium/cilium/pkg/node"
+	"github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy"
 	testidentity "github.com/cilium/cilium/pkg/testutils/identity"
@@ -54,8 +58,7 @@ type EndpointManagerSuite struct {
 
 func setupEndpointManagerSuite(tb testing.TB) *EndpointManagerSuite {
 	s := &EndpointManagerSuite{}
-	idAllocator := testidentity.NewMockIdentityAllocator(nil)
-	s.repo = policy.NewPolicyRepository(idAllocator, nil, nil, nil)
+	s.repo = policy.NewPolicyRepository(nil, nil, nil)
 
 	return s
 }
@@ -956,6 +959,154 @@ func TestWaitForEndpointsAtPolicyRev(t *testing.T) {
 		if args.cancel != nil {
 			args.cancel()
 		}
+		tt.postTestRun()
+	}
+}
+
+func TestMissingNodeLabelsUpdate(t *testing.T) {
+	// Initialize label filter config.
+	labelsfilter.ParseLabelPrefixCfg(nil, nil, "")
+	s := setupEndpointManagerSuite(t)
+	mgr := New(&dummyEpSyncher{}, nil, nil)
+	hostEPID := uint16(17)
+
+	// Initialize the local node watcher before the host endpoint is created.
+	// These labels are not propagated to the endpoint manager.
+	mgr.localNodeStore = node.NewTestLocalNodeStore(node.LocalNode{Node: types.Node{}})
+	mgr.startNodeLabelsObserver(nil)
+	mgr.localNodeStore.Update(func(ln *node.LocalNode) { ln.Labels = map[string]string{"k1": "v1"} })
+	_, ok := mgr.endpoints[hostEPID]
+	require.EqualValues(t, ok, false)
+
+	// Create host endpoint and expose it in the endpoint manager.
+	ep := endpoint.NewTestEndpointWithState(t, s, s, testipcache.NewMockIPCache(), &endpoint.FakeEndpointProxy{}, testidentity.NewMockIdentityAllocator(nil), 1, endpoint.StateReady)
+	ep.SetIsHost(true)
+	ep.ID = hostEPID
+	require.Nil(t, mgr.expose(ep))
+
+	// Update node labels and verify that the node labels are updated correctly even if the old
+	// labels {k1=v1} are not present in the endpoint manager's state.
+	mgr.localNodeStore.Update(func(ln *node.LocalNode) { ln.Labels = map[string]string{"k2": "v2"} })
+	hostEP, ok := mgr.endpoints[hostEPID]
+	require.EqualValues(t, ok, true)
+	got := hostEP.OpLabels.IdentityLabels().K8sStringMap()
+	require.EqualValues(t, map[string]string{"k2": "v2"}, got)
+}
+
+func TestUpdateHostEndpointLabels(t *testing.T) {
+	// Initialize label filter config.
+	labelsfilter.ParseLabelPrefixCfg([]string{"k8s:!ignore1", "k8s:!ignore2"}, nil, "")
+	s := setupEndpointManagerSuite(t)
+	mgr := New(&dummyEpSyncher{}, nil, nil)
+	hostEPID := uint16(17)
+	type args struct {
+		oldLabels, newLabels map[string]string
+	}
+	type want struct {
+		labels      map[string]string
+		labelsCheck assert.ComparisonAssertionFunc
+	}
+	tests := []struct {
+		name        string
+		setupArgs   func() args
+		setupWant   func() want
+		preTestRun  func()
+		postTestRun func()
+	}{
+		{
+			name: "Add labels",
+			preTestRun: func() {
+				ep := endpoint.NewTestEndpointWithState(t, s, s, testipcache.NewMockIPCache(), &endpoint.FakeEndpointProxy{}, testidentity.NewMockIdentityAllocator(nil), 1, endpoint.StateReady)
+				ep.SetIsHost(true)
+				ep.ID = hostEPID
+				require.Nil(t, mgr.expose(ep))
+			},
+			setupArgs: func() args {
+				return args{
+					newLabels: map[string]string{"k1": "v1"},
+				}
+			},
+			setupWant: func() want {
+				return want{
+					labels:      map[string]string{"k1": "v1"},
+					labelsCheck: assert.EqualValues,
+				}
+			},
+			postTestRun: func() {
+				if hostEP, ok := mgr.endpoints[hostEPID]; ok {
+					mgr.WaitEndpointRemoved(hostEP)
+				}
+			},
+		},
+		{
+			name: "Update labels",
+			preTestRun: func() {
+				ep := endpoint.NewTestEndpointWithState(t, s, s, testipcache.NewMockIPCache(), &endpoint.FakeEndpointProxy{}, testidentity.NewMockIdentityAllocator(nil), 1, endpoint.StateReady)
+				ep.SetIsHost(true)
+				ep.ID = hostEPID
+				ep.OpLabels.Custom = labels.Labels{"k1": labels.NewLabel("k1", "v1", labels.LabelSourceK8s)}
+				require.Nil(t, mgr.expose(ep))
+			},
+			setupArgs: func() args {
+				return args{
+					oldLabels: map[string]string{"k1": "v1"},
+					newLabels: map[string]string{"k2": "v2"},
+				}
+			},
+			setupWant: func() want {
+				return want{
+					labels:      map[string]string{"k2": "v2"},
+					labelsCheck: assert.EqualValues,
+				}
+			},
+			postTestRun: func() {
+				if hostEP, ok := mgr.endpoints[hostEPID]; ok {
+					mgr.WaitEndpointRemoved(hostEP)
+				}
+			},
+		},
+		{
+			name: "Ignore labels",
+			preTestRun: func() {
+				ep := endpoint.NewTestEndpointWithState(t, s, s, testipcache.NewMockIPCache(), &endpoint.FakeEndpointProxy{}, testidentity.NewMockIdentityAllocator(nil), 1, endpoint.StateReady)
+				ep.SetIsHost(true)
+				ep.ID = hostEPID
+				ep.OpLabels.Custom = labels.Labels{"k1": labels.NewLabel("k1", "v1", labels.LabelSourceK8s)}
+				require.Nil(t, mgr.expose(ep))
+			},
+			setupArgs: func() args {
+				return args{
+					oldLabels: map[string]string{"k1": "v1"},
+					newLabels: map[string]string{"k1": "v1", "ignore1": "v2", "ignore2": "v2"},
+				}
+			},
+			setupWant: func() want {
+				return want{
+					labels:      map[string]string{"k1": "v1"},
+					labelsCheck: assert.EqualValues,
+				}
+			},
+			postTestRun: func() {
+				if hostEP, ok := mgr.endpoints[hostEPID]; ok {
+					mgr.WaitEndpointRemoved(hostEP)
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt.preTestRun()
+		args := tt.setupArgs()
+		want := tt.setupWant()
+		mgr.localNodeStore = node.NewTestLocalNodeStore(node.LocalNode{Node: types.Node{
+			Labels: args.oldLabels,
+		}})
+		mgr.startNodeLabelsObserver(args.oldLabels)
+		mgr.localNodeStore.Update(func(ln *node.LocalNode) { ln.Labels = args.newLabels })
+
+		hostEP, ok := mgr.endpoints[hostEPID]
+		require.EqualValues(t, ok, true)
+		got := hostEP.OpLabels.IdentityLabels().K8sStringMap()
+		want.labelsCheck(t, want.labels, got, "Test Name: %s", tt.name)
 		tt.postTestRun()
 	}
 }

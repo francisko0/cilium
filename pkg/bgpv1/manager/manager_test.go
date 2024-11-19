@@ -10,9 +10,10 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 
 	restapi "github.com/cilium/cilium/api/v1/server/restapi/bgp"
+	"github.com/cilium/cilium/pkg/bgpv1/agent/mode"
 	"github.com/cilium/cilium/pkg/bgpv1/manager/instance"
 	"github.com/cilium/cilium/pkg/bgpv1/types"
 	v2alpha1api "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
@@ -64,7 +65,7 @@ func TestGetRoutes(t *testing.T) {
 			name:               "single IPv4 prefix - retrieve IPv4",
 			advertisedPrefixes: testSingleIPv4Prefix,
 			expectedPrefixes:   testSingleIPv4Prefix,
-			routerASN:          pointer.Int64(int64(testRouterASN)),
+			routerASN:          ptr.To[int64](int64(testRouterASN)),
 			tableType:          tableTypeLocRib,
 			afi:                afiIPv4,
 			safi:               safiUnicast,
@@ -75,7 +76,7 @@ func TestGetRoutes(t *testing.T) {
 			name:               "single IPv4 prefix - retrieve IPv6",
 			advertisedPrefixes: testSingleIPv4Prefix,
 			expectedPrefixes:   nil,
-			routerASN:          pointer.Int64(int64(testRouterASN)),
+			routerASN:          ptr.To[int64](int64(testRouterASN)),
 			tableType:          tableTypeLocRib,
 			afi:                afiIPv6,
 			safi:               safiUnicast,
@@ -108,7 +109,7 @@ func TestGetRoutes(t *testing.T) {
 			name:               "incorrect ASN",
 			advertisedPrefixes: testSingleIPv4Prefix,
 			expectedPrefixes:   nil,
-			routerASN:          pointer.Int64(int64(testInvalidRouterASN)),
+			routerASN:          ptr.To[int64](int64(testInvalidRouterASN)),
 			tableType:          tableTypeLocRib,
 			afi:                afiIPv4,
 			safi:               safiUnicast,
@@ -134,7 +135,7 @@ func TestGetRoutes(t *testing.T) {
 			tableType:          tableTypeLocAdjRibOut,
 			afi:                afiIPv4,
 			safi:               safiUnicast,
-			neighbor:           pointer.String(testNeighborIP),
+			neighbor:           ptr.To[string](testNeighborIP),
 			expectedErr:        nil,
 		},
 		{
@@ -145,7 +146,7 @@ func TestGetRoutes(t *testing.T) {
 			tableType:          tableTypeLocAdjRibOut,
 			afi:                afiIPv4,
 			safi:               safiUnicast,
-			neighbor:           pointer.String(testInvalidNeighborIP),
+			neighbor:           ptr.To[string](testInvalidNeighborIP),
 			expectedErr:        fmt.Errorf(""),
 		},
 	}
@@ -167,7 +168,11 @@ func TestGetRoutes(t *testing.T) {
 				LocalASN:  int64(testRouterASN),
 				Neighbors: []v2alpha1api.CiliumBGPNeighbor{},
 			}
+			cm := mode.NewConfigMode()
+			cm.Set(mode.BGPv1)
+
 			brm := &BGPRouterManager{
+				ConfigMode: cm,
 				Servers: map[int64]*instance.ServerWithConfig{
 					int64(testRouterASN): testSC,
 				},

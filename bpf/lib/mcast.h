@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
 /* Copyright Authors of Cilium */
 
-#ifndef __LIB_MCAST_H_
-#define __LIB_MCAST_H_
+#pragma once
 
 #include <bpf/api.h>
 #include <linux/ip.h>
@@ -434,13 +433,12 @@ int tail_mcast_ep_delivery(struct __ctx_buff *ctx)
 	for_each_map_elem(sub_map, __mcast_ep_delivery, &cb_ctx, 0);
 
 	return send_drop_notify(ctx,
-				0,
-				0,
-				0,
+				UNKNOWN_ID,
+				UNKNOWN_ID,
+				TRACE_EP_ID_UNKNOWN,
 				DROP_MULTICAST_HANDLED,
 				CTX_ACT_DROP,
 				METRIC_INGRESS);
 }
 
 #endif /* ENABLE_MULTICAST */
-#endif /* ___LIB_MCAST_H_ */

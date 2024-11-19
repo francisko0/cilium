@@ -96,7 +96,7 @@ kind-connect-clustermesh: check_deps kind-clustermesh-ready
 	$(CILIUM_CLI) clustermesh status --context kind-clustermesh1 --wait
 	$(CILIUM_CLI) clustermesh status --context kind-clustermesh2 --wait
 
-ENABLE_KVSTOREMESH ?= false
+ENABLE_KVSTOREMESH ?= true
 $(eval $(call KIND_ENV,kind-install-cilium-clustermesh))
 kind-install-cilium-clustermesh: check_deps kind-clustermesh-ready ## Install a local Cilium version into the clustermesh clusters and enable clustermesh.
 	@echo "  INSTALL cilium on clustermesh1 cluster"
@@ -224,20 +224,20 @@ kind-image-fast-agent: kind-ready build-cli build-agent ## Build cilium cli and 
 	$(eval dst:=/cilium-binaries)
 	for cluster_name in $${KIND_CLUSTERS:-$(shell kind get clusters)}; do \
 		for node_name in $$(kind get nodes -n "$$cluster_name"); do \
-			docker exec -ti $${node_name} mkdir -p "${dst}"; \
+			docker exec $${node_name} mkdir -p "${dst}"; \
 			\
-			docker exec -ti $${node_name} rm -rf "${dst}/var/lib/cilium"; \
-			docker exec -ti $${node_name} mkdir -p "${dst}/var/lib/cilium"; \
+			docker exec $${node_name} rm -rf "${dst}/var/lib/cilium"; \
+			docker exec $${node_name} mkdir -p "${dst}/var/lib/cilium"; \
 			docker cp "./bpf/" $${node_name}:"${dst}/var/lib/cilium/bpf"; \
-			docker exec -ti $${node_name} find "${dst}/var/lib/cilium/bpf" -type f -exec chmod 0644 {} + ;\
+			docker exec $${node_name} find "${dst}/var/lib/cilium/bpf" -type f -exec chmod 0644 {} + ;\
 			\
-			docker exec -ti $${node_name} rm -f "${dst}/cilium-dbg"; \
+			docker exec $${node_name} rm -f "${dst}/cilium-dbg"; \
 			docker cp "./cilium-dbg/cilium-dbg" $${node_name}:"${dst}"; \
-			docker exec -ti $${node_name} chmod +x "${dst}/cilium-dbg"; \
+			docker exec $${node_name} chmod +x "${dst}/cilium-dbg"; \
 			\
-			docker exec -ti $${node_name} rm -f "${dst}/cilium-agent"; \
+			docker exec $${node_name} rm -f "${dst}/cilium-agent"; \
 			docker cp "./daemon/cilium-agent" $${node_name}:"${dst}"; \
-			docker exec -ti $${node_name} chmod +x "${dst}/cilium-agent"; \
+			docker exec $${node_name} chmod +x "${dst}/cilium-agent"; \
 		done; \
 		kubectl --context=kind-$${cluster_name} delete pods -n kube-system -l k8s-app=cilium --force; \
 	done
@@ -247,11 +247,11 @@ kind-image-fast-operator: kind-ready build-operator ## Build cilium operator bin
 	$(eval dst:=/cilium-binaries)
 	for cluster_name in $${KIND_CLUSTERS:-$(shell kind get clusters)}; do \
 		for node_name in $$(kind get nodes -n "$$cluster_name"); do \
-			docker exec -ti $${node_name} mkdir -p "${dst}"; \
+			docker exec $${node_name} mkdir -p "${dst}"; \
 			\
-			docker exec -ti $${node_name} rm -f "${dst}/cilium-operator-generic"; \
+			docker exec $${node_name} rm -f "${dst}/cilium-operator-generic"; \
 			docker cp "./operator/cilium-operator-generic" $${node_name}:"${dst}"; \
-			docker exec -ti $${node_name} chmod +x "${dst}/cilium-operator-generic"; \
+			docker exec $${node_name} chmod +x "${dst}/cilium-operator-generic"; \
 		done; \
 	kubectl --context=kind-$${cluster_name} delete pods -n kube-system -l name=cilium-operator --force; \
 	done
@@ -261,11 +261,11 @@ kind-image-fast-clustermesh-apiserver: kind-ready build-clustermesh-apiserver ##
 	$(eval dst:=/cilium-binaries)
 	for cluster_name in $${KIND_CLUSTERS:-$(shell kind get clusters)}; do \
 		for node_name in $$(kind get nodes -n "$$cluster_name"); do \
-			docker exec -ti $${node_name} mkdir -p "${dst}"; \
+			docker exec $${node_name} mkdir -p "${dst}"; \
 			\
-			docker exec -ti $${node_name} rm -f "${dst}/clustermesh-apiserver"; \
+			docker exec $${node_name} rm -f "${dst}/clustermesh-apiserver"; \
 			docker cp "./clustermesh-apiserver/clustermesh-apiserver" $${node_name}:"${dst}"; \
-			docker exec -ti $${node_name} chmod +x "${dst}/clustermesh-apiserver"; \
+			docker exec $${node_name} chmod +x "${dst}/clustermesh-apiserver"; \
 		done; \
 	kubectl --context=kind-$${cluster_name} delete pods -n kube-system -l k8s-app=clustermesh-apiserver --force; \
 	done
@@ -316,6 +316,32 @@ kind-egressgw-install-cilium: check_deps kind-ready ## Install a local Cilium ve
 		--nodes-without-cilium \
 		--version= \
 		>/dev/null 2>&1 &
+
+KVSTORE_POD_NAME ?= "kvstore"
+KVSTORE_POD_PORT ?= "2378"
+
+.PHONY: kind-kvstore-install-cilium
+kind-kvstore-install-cilium: check_deps kind-ready kind-kvstore-start ## Install a local Cilium version into the cluster, configured in kvstore mode.
+	$(MAKE) kind-install-cilium KIND_VALUES_FILES="\
+		$(KIND_VALUES_FILES) \
+		--set etcd.enabled=true \
+		--set etcd.endpoints[0]=http://$(shell kubectl --namespace kube-system get pod $(KVSTORE_POD_NAME) -o jsonpath='{.status.hostIP}'):$(KVSTORE_POD_PORT) \
+		--set identityAllocationMode=kvstore \
+	"
+
+.PHONY: kind-kvstore-start
+kind-kvstore-start: ## Start an etcd pod serving as Cilium's kvstore
+	kubectl --namespace kube-system get pod $(KVSTORE_POD_NAME) >/dev/null 2>/dev/null || \
+		kubectl --namespace kube-system run $(KVSTORE_POD_NAME) --image $(ETCD_IMAGE) \
+			--overrides='{ "apiVersion": "v1", "spec": { "hostNetwork": true, "nodeSelector": {"node-role.kubernetes.io/control-plane": ""},  "tolerations": [{ "operator": "Exists" }] }}' \
+			-- etcd --listen-client-urls=http://0.0.0.0:$(KVSTORE_POD_PORT) --advertise-client-urls=http://0.0.0.0:$(KVSTORE_POD_PORT)
+
+	kubectl --namespace kube-system wait --for=condition=Ready pod/$(KVSTORE_POD_NAME)
+
+.PHONY: kind-kvstore-stop
+kind-kvstore-stop: ## Stop the etcd pod serving as Cilium's kvstore
+	kubectl --namespace kube-system delete pod $(KVSTORE_POD_NAME) --ignore-not-found
+	kubectl --namespace kube-system wait --for=delete pod/$(KVSTORE_POD_NAME)
 
 .PHONY: kind-uninstall-cilium
 kind-uninstall-cilium: check_deps ## Uninstall Cilium from the cluster.

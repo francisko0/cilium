@@ -32,6 +32,7 @@ focus:
 - "f18-datapath-bgp-lrp"
 - "f19-update"
 - "f20-kafka"
+- "f21-datapath-misc-3"
 include:
   ###
   # K8sAgentChaosTest Connectivity demo application Endpoint can still connect while Cilium is not running
@@ -80,9 +81,6 @@ include:
     cliFocus: "K8sAgentPolicyTest Multi-node policy test validates ingress"
 
   ###
-  # K8sAgentPolicyTest Basic Test Traffic redirections to proxy Tests DNS proxy visibility without policy
-  # K8sAgentPolicyTest Basic Test Traffic redirections to proxy Tests HTTP proxy visibility without policy
-  # K8sAgentPolicyTest Basic Test Traffic redirections to proxy Tests proxy visibility interactions with policy lifecycle operations
   # K8sAgentPolicyTest Basic Test Traffic redirections to proxy Tests proxy visibility with L7 default-allow rules
   # K8sAgentPolicyTest Basic Test Traffic redirections to proxy Tests proxy visibility with L7 rules
   # K8sPolicyTestExtended Validate toEntities KubeAPIServer Allows connection to KubeAPIServer
@@ -108,17 +106,21 @@ include:
     cliFocus: "K8sDatapathConfig Encapsulation|K8sDatapathConfig Etcd|K8sDatapathConfig Etcd|K8sDatapathConfig MonitorAggregation"
 
   ###
-  # K8sDatapathConfig WireGuard encryption strict mode Pod-to-pod traffic is encrypted in native routing mode with per-endpoint routes
-  # K8sDatapathConfig WireGuard encryption strict mode Pod-to-pod traffic is encrypted in native routing mode with per-endpoint routes and overlapping node and pod CIDRs
   # K8sDatapathConfig Check BPF masquerading with ip-masq-agent DirectRouting
   # K8sDatapathConfig Check BPF masquerading with ip-masq-agent DirectRouting, IPv4 only
   # K8sDatapathConfig Check BPF masquerading with ip-masq-agent VXLAN
-  # K8sDatapathConfig High-scale IPcache Test ingress policy enforcement with GENEVE and endpoint routes
+  - focus: "f09-datapath-misc-2"
+    cliFocus: "K8sDatapathConfig Check"
+
+  ###
+  # K8sDatapathConfig WireGuard encryption strict mode Pod-to-pod traffic is encrypted in native routing mode with per-endpoint routes
+  # K8sDatapathConfig WireGuard encryption strict mode Pod-to-pod traffic is encrypted in native routing mode with per-endpoint routes and overlapping node and pod CIDRs
   # K8sDatapathConfig Iptables Skip conntrack for pod traffic
   # K8sDatapathConfig IPv4Only Check connectivity with IPv6 disabled
   # K8sDatapathConfig IPv6 masquerading across K8s nodes, skipped due to native routing CIDR
-  - focus: "f09-datapath-misc-2"
-    cliFocus: "K8sDatapathConfig WireGuard encryption strict mode|K8sDatapathConfig Check|K8sDatapathConfig IPv4Only|K8sDatapathConfig High-scale|K8sDatapathConfig Iptables|K8sDatapathConfig IPv4Only|K8sDatapathConfig IPv6"
+  # K8sDatapathConfig High-scale IPcache Test ingress policy enforcement with GENEVE and endpoint routes
+  - focus: "f21-datapath-misc-3"
+    cliFocus: "K8sDatapathConfig WireGuard encryption strict mode|K8sDatapathConfig Iptables|K8sDatapathConfig IPv4Only|K8sDatapathConfig IPv6|K8sDatapathConfig High-scale"
 
   ###
   # K8sAgentHubbleTest Hubble Observe Test FQDN Policy with Relay
@@ -188,7 +190,7 @@ include:
     cliFocus: 'K8sDatapathServicesTest Checks E/W loadbalancing \\(ClusterIP, NodePort from inside cluster, etc\\) TFTP|K8sDatapathServicesTest Checks E/W loadbalancing \\(ClusterIP, NodePort from inside cluster, etc\\) with'
 
   ###
-  # K8sDatapathServicesTest Checks E/W loadbalancing (ClusterIP, NodePort from inside cluster, etc) Tests NodePort inside cluster (kube-proxy) 
+  # K8sDatapathServicesTest Checks E/W loadbalancing (ClusterIP, NodePort from inside cluster, etc) Tests NodePort inside cluster (kube-proxy) vanilla
   # K8sDatapathServicesTest Checks E/W loadbalancing (ClusterIP, NodePort from inside cluster, etc) Tests NodePort inside cluster (kube-proxy) with externalTrafficPolicy=Local
   # K8sDatapathServicesTest Checks E/W loadbalancing (ClusterIP, NodePort from inside cluster, etc) Tests NodePort inside cluster (kube-proxy) with IPSec and externalTrafficPolicy=Local
   # K8sDatapathServicesTest Checks E/W loadbalancing (ClusterIP, NodePort from inside cluster, etc) Tests NodePort inside cluster (kube-proxy) with the host firewall and externalTrafficPolicy=Local

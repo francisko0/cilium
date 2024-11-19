@@ -2,12 +2,11 @@ allowed-teams:
   - organization-members
 
 triggers:
-  /test:
+  /test-backport-1.16:
     workflows:
     - conformance-aks.yaml
     - conformance-aws-cni.yaml
     - conformance-clustermesh.yaml
-    - conformance-e2e.yaml
     - conformance-ipsec-e2e.yaml
     - conformance-eks.yaml
     - conformance-externalworkloads.yaml
@@ -33,9 +32,6 @@ triggers:
     workflows:
     - conformance-clustermesh.yaml
     - tests-clustermesh-upgrade.yaml
-  /ci-e2e:
-    workflows:
-    - conformance-e2e.yaml
   /ci-e2e-upgrade:
     workflows:
     - tests-e2e-upgrade.yaml
@@ -78,6 +74,15 @@ triggers:
   /ci-l4lb:
     workflows:
     - tests-l4lb.yaml
+  /fqdn-perf:
+    workflows:
+    - fqdn-perf.yaml
+  /scale-100:
+    workflows:
+    - scale-test-100-gce.yaml
+  /net-perf-gke:
+    workflows:
+    - net-perf-gke.yaml
 
 workflows:
   conformance-aks.yaml:
@@ -85,8 +90,6 @@ workflows:
   conformance-aws-cni.yaml:
     paths-ignore-regex: (test|Documentation)/
   conformance-clustermesh.yaml:
-    paths-ignore-regex: (test|Documentation)/
-  conformance-e2e.yaml:
     paths-ignore-regex: (test|Documentation)/
   conformance-ipsec-e2e.yaml:
     paths-ignore-regex: (test|Documentation)/

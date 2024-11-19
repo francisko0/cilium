@@ -20,6 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
+	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 
 	"github.com/cilium/cilium/operator/pkg/gateway-api/helpers"
 	"github.com/cilium/cilium/operator/pkg/model/translation"
@@ -28,6 +29,7 @@ import (
 )
 
 const (
+	// Deprecated: owningGatewayLabel will be removed later in favour of gatewayNameLabel
 	owningGatewayLabel = "io.cilium.gateway/owning-gateway"
 
 	lastTransitionTime = "LastTransitionTime"
@@ -59,7 +61,7 @@ func (r *gatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// Watch GatewayClass resources, which are linked to Gateway
 		Watches(&gatewayv1.GatewayClass{},
 			r.enqueueRequestForOwningGatewayClass(),
-			builder.WithPredicates(predicate.NewPredicateFuncs(hasMatchingControllerFn))).
+			builder.WithPredicates(predicate.NewPredicateFuncs(matchesControllerName(controllerName)))).
 		// Watch related LB service for status
 		Watches(&corev1.Service{},
 			r.enqueueRequestForOwningResource(),
@@ -79,7 +81,7 @@ func (r *gatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			builder.WithPredicates(onlyStatusChanged())).
 		// Watch GRPCRoute status changes, there is one assumption that any change in spec will
 		// always update status always at least for observedGeneration value.
-		Watches(&gatewayv1alpha2.GRPCRoute{},
+		Watches(&gatewayv1.GRPCRoute{},
 			r.enqueueRequestForOwningGRPCRoute(),
 			builder.WithPredicates(onlyStatusChanged())).
 		// Watch related secrets used to configure TLS
@@ -89,6 +91,8 @@ func (r *gatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// Watch related namespace in allowed namespaces
 		Watches(&corev1.Namespace{},
 			r.enqueueRequestForAllowedNamespace()).
+		// Watch for changes to Reference Grants
+		Watches(&gatewayv1beta1.ReferenceGrant{}, r.enqueueRequestForReferenceGrant()).
 		// Watch created and owned resources
 		Owns(&ciliumv2.CiliumEnvoyConfig{}).
 		Owns(&corev1.Service{}).
@@ -192,7 +196,7 @@ func (r *gatewayReconciler) enqueueRequestForOwningTLSRoute() handler.EventHandl
 // belonging to the given Gateway
 func (r *gatewayReconciler) enqueueRequestForOwningGRPCRoute() handler.EventHandler {
 	return handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, a client.Object) []reconcile.Request {
-		gr, ok := a.(*gatewayv1alpha2.GRPCRoute)
+		gr, ok := a.(*gatewayv1.GRPCRoute)
 		if !ok {
 			return nil
 		}
@@ -286,4 +290,36 @@ func (r *gatewayReconciler) enqueueRequestForAllowedNamespace() handler.EventHan
 
 func (r *gatewayReconciler) usedInGateway(obj client.Object) bool {
 	return len(getGatewaysForSecret(context.Background(), r.Client, obj)) > 0
+}
+
+func (r *gatewayReconciler) enqueueRequestForReferenceGrant() handler.EventHandler {
+	return handler.EnqueueRequestsFromMapFunc(r.enqueueAll())
+}
+
+func (r *gatewayReconciler) enqueueAll() handler.MapFunc {
+	return func(ctx context.Context, o client.Object) []reconcile.Request {
+		scopedLog := log.WithFields(logrus.Fields{
+			logfields.Controller: "gateway",
+			logfields.Resource:   client.ObjectKeyFromObject(o),
+		})
+		list := &gatewayv1.GatewayList{}
+
+		if err := r.Client.List(ctx, list, &client.ListOptions{}); err != nil {
+			scopedLog.WithError(err).Error("Failed to list Gateway")
+			return []reconcile.Request{}
+		}
+
+		requests := make([]reconcile.Request, 0, len(list.Items))
+		for _, item := range list.Items {
+			gw := client.ObjectKey{
+				Namespace: item.GetNamespace(),
+				Name:      item.GetName(),
+			}
+			requests = append(requests, reconcile.Request{
+				NamespacedName: gw,
+			})
+			scopedLog.Info("Enqueued Gateway for resource", gateway, gw)
+		}
+		return requests
+	}
 }

@@ -2,18 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ARG TESTER_IMAGE=quay.io/cilium/image-tester:dd09c8d3ef349a909fbcdc99279516baef153f22@sha256:c056d064cb47c97acd607343db5457e1d49d9338d6d8a87e93e23cc93f052c73
-ARG GOLANG_IMAGE=docker.io/library/golang:1.22.3@sha256:b1e05e2c918f52c59d39ce7d5844f73b2f4511f7734add8bb98c9ecdd4443365
-ARG UBUNTU_IMAGE=docker.io/library/ubuntu:22.04@sha256:6d7b5d3317a71adb5e175640150e44b8b9a9401a7dd394f44840626aff9fa94d
+ARG GOLANG_IMAGE=docker.io/library/golang:1.22.9@sha256:4cfe4a9a7ff5817f93e70bcc016ea269401290ec9bd9509b4f0a2dd553640944
+ARG UBUNTU_IMAGE=docker.io/library/ubuntu:22.04@sha256:0e5e4a57c2499249aafc3b40fcd541e9a456aab7296681a3994d631587203f97
 
 ARG CILIUM_LLVM_IMAGE=quay.io/cilium/cilium-llvm:9f1bfe736009afb1fbb562718bbc42ea07d37d8e@sha256:a666a7a01a2dc610c3ab6e32f25ca5e294201f3cbbc01f233320c527955deee3
 ARG CILIUM_BPFTOOL_IMAGE=quay.io/cilium/cilium-bpftool:0db3a73729ceb42e947d826bb96a655be79e5317@sha256:de23c9546c4eafab33f75d6f5d129947bbbafc132dbd113c0cecc9a61929e6b0
 ARG CILIUM_IPTABLES_IMAGE=quay.io/cilium/iptables:67f517af50e18f64cd12625021f1c39246bb4f92@sha256:d075f03e89aacf51908346ec8ed5d251b8d3ad528ce30a710fcd074cdf91f11d
 
-FROM ${CILIUM_LLVM_IMAGE} as llvm-dist
-FROM ${CILIUM_BPFTOOL_IMAGE} as bpftool-dist
-FROM ${CILIUM_IPTABLES_IMAGE} as iptables-dist
+FROM ${CILIUM_LLVM_IMAGE} AS llvm-dist
+FROM ${CILIUM_BPFTOOL_IMAGE} AS bpftool-dist
+FROM ${CILIUM_IPTABLES_IMAGE} AS iptables-dist
 
-FROM --platform=${BUILDPLATFORM} ${GOLANG_IMAGE} as gops-cni-builder
+FROM --platform=${BUILDPLATFORM} ${GOLANG_IMAGE} AS gops-cni-builder
 
 RUN apt-get update && apt-get install -y binutils-aarch64-linux-gnu binutils-x86-64-linux-gnu
 
@@ -25,7 +25,7 @@ RUN --mount=type=bind,readwrite,target=/go/src/github.com/cilium/cilium/images/r
 RUN --mount=type=bind,readwrite,target=/go/src/github.com/cilium/cilium/images/runtime --mount=target=/root/.cache,type=cache --mount=target=/go/pkg/mod,type=cache \
     ./download-cni.sh
 
-FROM ${UBUNTU_IMAGE} as rootfs
+FROM ${UBUNTU_IMAGE} AS rootfs
 
 # Change the number to force the generation of a new git-tree SHA. Useful when
 # we want to re-run 'apt-get upgrade' for stale images.
@@ -53,7 +53,7 @@ ARG TARGETPLATFORM
 COPY --from=gops-cni-builder /out/${TARGETPLATFORM}/bin/loopback /cni/loopback
 COPY --from=gops-cni-builder /out/${TARGETPLATFORM}/bin/gops /bin/gops
 
-FROM ${TESTER_IMAGE} as test
+FROM ${TESTER_IMAGE} AS test
 COPY --from=rootfs / /
 COPY --from=llvm-dist /test /test
 COPY --from=bpftool-dist /test /test

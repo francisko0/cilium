@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
 /* Copyright Authors of Cilium */
 
-#ifndef __LIB_SRV6_H_
-#define __LIB_SRV6_H_
+#pragma once
 
 #include "lib/common.h"
 #include "lib/fib.h"
@@ -127,12 +126,18 @@ srv6_encapsulation(struct __ctx_buff *ctx, int growth, __u16 new_payload_len,
 		   __u8 nexthdr, union v6addr *saddr, struct in6_addr *sid)
 {
 	__u32 len = sizeof(struct ipv6hdr) - 2 * sizeof(struct in6_addr);
+	__u32 hash;
+
 	struct ipv6hdr new_ip6 = {
 		.version     = 0x6,
 		.payload_len = bpf_htons(new_payload_len),
 		.nexthdr     = nexthdr,
 		.hop_limit   = IPDEFTTL,
 	};
+
+	hash = get_hash_recalc(ctx);
+	new_ip6.flow_lbl[1] = (hash >> 16) & 0xff;
+	new_ip6.flow_lbl[2] = (hash >> 24) & 0xff;
 
 #ifdef ENABLE_SRV6_SRH_ENCAP
 	/* If reduced encapsulation is disabled, the next header will be the
@@ -379,7 +384,8 @@ int tail_srv6_encap(struct __ctx_buff *ctx)
 		return send_drop_notify_error(ctx, SECLABEL_IPV6, ret, CTX_ACT_DROP,
 					      METRIC_EGRESS);
 
-	send_trace_notify(ctx, TRACE_TO_STACK, SECLABEL_IPV6, 0, 0,
+	send_trace_notify(ctx, TRACE_TO_STACK, SECLABEL_IPV6, UNKNOWN_ID,
+			  TRACE_EP_ID_UNKNOWN,
 			  TRACE_IFINDEX_UNKNOWN, TRACE_REASON_SRV6_ENCAP, 0);
 
 	return ret;
@@ -394,7 +400,8 @@ int tail_srv6_decap(struct __ctx_buff *ctx)
 	if (ret < 0)
 		goto error_drop;
 
-	send_trace_notify(ctx, TRACE_TO_STACK, SECLABEL_IPV6, 0, 0,
+	send_trace_notify(ctx, TRACE_TO_STACK, SECLABEL_IPV6, UNKNOWN_ID,
+			  TRACE_EP_ID_UNKNOWN,
 			  TRACE_IFINDEX_UNKNOWN, TRACE_REASON_SRV6_DECAP, 0);
 	return CTX_ACT_OK;
 error_drop:
@@ -403,4 +410,3 @@ error_drop:
 }
 # endif /* SKIP_SRV6_HANDLING */
 #endif /* ENABLE_SRV6 */
-#endif /* __LIB_SRV6_H_ */

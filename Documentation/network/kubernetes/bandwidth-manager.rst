@@ -47,10 +47,6 @@ bandwidth usage on the wire, and the node has already spent resources on
 processing the packet. ``kubernetes.io/ingress-bandwidth`` annotation is ignored
 by Cilium's bandwidth manager.
 
-.. note::
-
-   Bandwidth Manager requires a v5.1.x or more recent Linux kernel.
-
 .. include:: ../../installation/k8s-install-download-release.rst
 
 Cilium's bandwidth manager is disabled by default on new installations.
@@ -260,4 +256,4 @@ Limitations
 .. admonition:: Video
   :class: attention
 
-  For more insights on Cilium's bandwidth manager, check out this `KubeCon talk on Better Bandwidth Management with eBPF <https://www.youtube.com/watch?v=QTSS6ktK8hY>`__.
+  For more insights on Cilium's bandwidth manager, check out this `KubeCon talk on Better Bandwidth Management with eBPF <https://www.youtube.com/watch?v=QTSS6ktK8hY>`__ and `eCHO episode 98: Exploring the bandwidth manager with Cilium <https://www.youtube.com/watch?v=-JnXe8vAUKQ>`__.

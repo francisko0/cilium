@@ -309,11 +309,12 @@ func probeKubeProxyReplacementOptions(sysctl sysctl.Sysctl) error {
 		if option.Config.EnableSocketLBTracing {
 			if probes.HaveProgramHelper(ebpf.CGroupSockAddr, asm.FnPerfEventOutput) != nil {
 				option.Config.EnableSocketLBTracing = false
-				log.Warn("Disabling socket-LB tracing as it requires kernel 5.7 or newer")
+				log.Info("Disabling socket-LB tracing as it requires kernel 5.7 or newer")
 			}
 		}
 	} else {
 		option.Config.EnableSocketLBTracing = false
+		option.Config.EnableSocketLBPodConnectionTermination = false
 	}
 
 	if option.Config.EnableSessionAffinity && option.Config.EnableSocketLB {
@@ -422,7 +423,7 @@ func finishKubeProxyReplacementInit(sysctl sysctl.Sysctl, devices []*tables.Devi
 		// routing one.
 
 		iface := option.Config.DirectRoutingDevice
-		if val, err := sysctl.Read(fmt.Sprintf("net.ipv4.conf.%s.rp_filter", iface)); err != nil {
+		if val, err := sysctl.Read([]string{"net", "ipv4", "conf", iface, "rp_filter"}); err != nil {
 			log.Warnf("Unable to read net.ipv4.conf.%s.rp_filter: %s. Ignoring the check",
 				iface, err)
 		} else {
@@ -518,7 +519,7 @@ func markHostExtension() {
 // Otherwise, if EnableAutoProtectNodePortRange == true, then append the nodeport
 // range to ip_local_reserved_ports.
 func checkNodePortAndEphemeralPortRanges(sysctl sysctl.Sysctl) error {
-	ephemeralPortRangeStr, err := sysctl.Read("net.ipv4.ip_local_port_range")
+	ephemeralPortRangeStr, err := sysctl.Read([]string{"net", "ipv4", "ip_local_port_range"})
 	if err != nil {
 		return fmt.Errorf("Unable to read net.ipv4.ip_local_port_range: %w", err)
 	}
@@ -550,7 +551,7 @@ func checkNodePortAndEphemeralPortRanges(sysctl sysctl.Sysctl) error {
 			nodePortRangeStr, ephemeralPortRangeStr)
 	}
 
-	reservedPortsStr, err := sysctl.Read("net.ipv4.ip_local_reserved_ports")
+	reservedPortsStr, err := sysctl.Read([]string{"net", "ipv4", "ip_local_reserved_ports"})
 	if err != nil {
 		return fmt.Errorf("Unable to read net.ipv4.ip_local_reserved_ports: %w", err)
 	}
@@ -596,7 +597,7 @@ func checkNodePortAndEphemeralPortRanges(sysctl sysctl.Sysctl) error {
 		reservedPortsStr += ","
 	}
 	reservedPortsStr += fmt.Sprintf("%d-%d", option.Config.NodePortMin, option.Config.NodePortMax)
-	if err := sysctl.Write("net.ipv4.ip_local_reserved_ports", reservedPortsStr); err != nil {
+	if err := sysctl.Write([]string{"net", "ipv4", "ip_local_reserved_ports"}, reservedPortsStr); err != nil {
 		return fmt.Errorf("Unable to addend nodeport range (%s) to net.ipv4.ip_local_reserved_ports: %w",
 			nodePortRangeStr, err)
 	}

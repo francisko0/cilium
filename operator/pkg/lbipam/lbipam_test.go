@@ -48,7 +48,7 @@ func TestConflictResolution(t *testing.T) {
 	// Phase 2, resolving the conflict
 
 	// Remove the conflicting range
-	poolB.Spec.Cidrs = []cilium_api_v2alpha1.CiliumLoadBalancerIPPoolIPBlock{
+	poolB.Spec.Blocks = []cilium_api_v2alpha1.CiliumLoadBalancerIPPoolIPBlock{
 		{
 			Cidr: cilium_api_v2alpha1.IPv4orIPv6CIDR("FF::0/48"),
 		},
@@ -74,7 +74,7 @@ func TestPoolInternalConflict(t *testing.T) {
 		t.Fatal("Pool A should be conflicting")
 	}
 
-	poolA.Spec.Cidrs = []cilium_api_v2alpha1.CiliumLoadBalancerIPPoolIPBlock{
+	poolA.Spec.Blocks = []cilium_api_v2alpha1.CiliumLoadBalancerIPPoolIPBlock{
 		{
 			Cidr: "10.0.10.0/24",
 		},
@@ -518,6 +518,101 @@ func TestSharingKey(t *testing.T) {
 	}
 }
 
+func TestRegressionSharedKeyReaddBug(t *testing.T) {
+	poolA := mkPool(poolAUID, "pool-a", []string{"10.0.10.0/24"})
+	fixture := mkTestFixture(true, true)
+	fixture.UpsertPool(t, poolA)
+
+	svcA := &slim_core_v1.Service{
+		ObjectMeta: slim_meta_v1.ObjectMeta{
+			Name:      "service-a",
+			Namespace: "default",
+			UID:       serviceAUID,
+			Annotations: map[string]string{
+				"io.cilium/lb-ipam-sharing-key": "key-a",
+			},
+		},
+		Spec: slim_core_v1.ServiceSpec{
+			Type: slim_core_v1.ServiceTypeLoadBalancer,
+			IPFamilies: []slim_core_v1.IPFamily{
+				slim_core_v1.IPv4Protocol,
+			},
+		},
+	}
+	fixture.UpsertSvc(t, svcA)
+
+	svcA = fixture.GetSvc("default", "service-a")
+	if len(svcA.Status.LoadBalancer.Ingress) != 1 {
+		t.Error("Expected service to receive exactly one ingress IP")
+	}
+
+	if net.ParseIP(svcA.Status.LoadBalancer.Ingress[0].IP).To4() == nil {
+		t.Error("Expected service to receive a IPv4 address")
+	}
+
+	svcIP := svcA.Status.LoadBalancer.Ingress[0].IP
+
+	if _, has := fixture.lbipam.rangesStore.ranges[0].alloc.Get(netip.MustParseAddr(svcIP)); !has {
+		t.Fatal("Service IP hasn't been allocated")
+	}
+
+	svcB := &slim_core_v1.Service{
+		ObjectMeta: slim_meta_v1.ObjectMeta{
+			Name:      "service-b",
+			Namespace: "default",
+			UID:       serviceBUID,
+			Annotations: map[string]string{
+				"io.cilium/lb-ipam-sharing-key": "key-a",
+			},
+		},
+		Spec: slim_core_v1.ServiceSpec{
+			Type: slim_core_v1.ServiceTypeLoadBalancer,
+			IPFamilies: []slim_core_v1.IPFamily{
+				slim_core_v1.IPv4Protocol,
+			},
+		},
+	}
+	fixture.UpsertSvc(t, svcB)
+
+	svcB = fixture.GetSvc("default", "service-b")
+	if len(svcB.Status.LoadBalancer.Ingress) != 1 {
+		t.Error("Expected service to receive exactly one ingress IP")
+	}
+
+	if net.ParseIP(svcB.Status.LoadBalancer.Ingress[0].IP).To4() == nil {
+		t.Error("Expected service to receive a IPv4 address")
+	}
+
+	if svcB.Status.LoadBalancer.Ingress[0].IP != svcIP {
+		t.Error("Expected service to receive the same IP as service-a")
+	}
+
+	if _, has := fixture.lbipam.rangesStore.ranges[0].alloc.Get(netip.MustParseAddr(svcIP)); !has {
+		t.Fatal("Service IP hasn't been allocated")
+	}
+
+	fixture.DeleteSvc(t, svcB)
+
+	fixture.UpsertSvc(t, svcB)
+
+	svcB = fixture.GetSvc("default", "service-b")
+	if len(svcB.Status.LoadBalancer.Ingress) != 1 {
+		t.Error("Expected service to receive exactly one ingress IP")
+	}
+
+	if net.ParseIP(svcB.Status.LoadBalancer.Ingress[0].IP).To4() == nil {
+		t.Error("Expected service to receive a IPv4 address")
+	}
+
+	if svcB.Status.LoadBalancer.Ingress[0].IP != svcIP {
+		t.Error("Expected service to receive the same IP as service-a")
+	}
+
+	if _, has := fixture.lbipam.rangesStore.ranges[0].alloc.Get(netip.MustParseAddr(svcIP)); !has {
+		t.Fatal("Service IP hasn't been allocated")
+	}
+}
+
 // TestSharingCrossNamespace tests that the sharing of IPs is possible cross namespace when allowed.
 func TestSharingCrossNamespace(t *testing.T) {
 	poolA := mkPool(poolAUID, "pool-a", []string{"10.0.10.0/24"})
@@ -810,6 +905,81 @@ func TestAllocOnInit(t *testing.T) {
 
 	if _, has := fixture.lbipam.rangesStore.ranges[0].alloc.Get(netip.MustParseAddr("10.0.10.124")); !has {
 		t.Fatal("Expected the imported IP to be allocated")
+	}
+}
+
+// TestAllocSharedOnInit tests that on init, ingress IPs on services which match configured pools are imported
+// and marked as allocated, and that services sharing IPs are allocated the same IP.
+func TestAllocSharedOnInit(t *testing.T) {
+	poolA := mkPool(poolAUID, "pool-a", []string{"10.0.10.0/24"})
+	fixture := mkTestFixture(true, true)
+	fixture.UpsertPool(t, poolA)
+
+	policy := slim_core_v1.IPFamilyPolicySingleStack
+	svcA := &slim_core_v1.Service{
+		ObjectMeta: slim_meta_v1.ObjectMeta{
+			Name:      "service-a",
+			Namespace: "default",
+			UID:       serviceAUID,
+			Annotations: map[string]string{
+				annotation.LBIPAMSharingKey: "key-1",
+			},
+		},
+		Spec: slim_core_v1.ServiceSpec{
+			Type:           slim_core_v1.ServiceTypeLoadBalancer,
+			IPFamilyPolicy: &policy,
+			IPFamilies: []slim_core_v1.IPFamily{
+				slim_core_v1.IPv4Protocol,
+			},
+		},
+		Status: slim_core_v1.ServiceStatus{
+			LoadBalancer: slim_core_v1.LoadBalancerStatus{
+				Ingress: []slim_core_v1.LoadBalancerIngress{
+					{
+						IP: "10.0.10.123",
+					},
+				},
+			},
+		},
+	}
+	fixture.UpsertSvc(t, svcA)
+	svcA = fixture.GetSvc("default", "service-a")
+
+	svcB := &slim_core_v1.Service{
+		ObjectMeta: slim_meta_v1.ObjectMeta{
+			Name:      "service-b",
+			Namespace: "default",
+			UID:       serviceBUID,
+			Annotations: map[string]string{
+				annotation.LBIPAMSharingKey: "key-1",
+			},
+		},
+		Spec: slim_core_v1.ServiceSpec{
+			Type:           slim_core_v1.ServiceTypeLoadBalancer,
+			IPFamilyPolicy: &policy,
+			IPFamilies: []slim_core_v1.IPFamily{
+				slim_core_v1.IPv4Protocol,
+			},
+		},
+		Status: slim_core_v1.ServiceStatus{
+			LoadBalancer: slim_core_v1.LoadBalancerStatus{
+				Ingress: []slim_core_v1.LoadBalancerIngress{
+					{
+						IP: "10.0.10.123",
+					},
+				},
+			},
+		},
+	}
+	fixture.UpsertSvc(t, svcB)
+	svcB = fixture.GetSvc("default", "service-b")
+
+	if svcA.Status.LoadBalancer.Ingress[0].IP != "10.0.10.123" {
+		t.Error("Expected service A to receive ingress IP 10.0.10.123 got ", svcA.Status.LoadBalancer.Ingress[0].IP)
+	}
+
+	if svcB.Status.LoadBalancer.Ingress[0].IP != "10.0.10.123" {
+		t.Error("Expected service B to receive ingress IP 10.0.10.123, got ", svcB.Status.LoadBalancer.Ingress[0].IP)
 	}
 }
 
@@ -1117,6 +1287,7 @@ func TestAllowFirstLastIPs(t *testing.T) {
 func TestUpdateAllowFirstAndLastIPs(t *testing.T) {
 	// Add pool which does not allow first and last IPs
 	poolA := mkPool(poolAUID, "pool-a", []string{"10.0.10.16/30"})
+	poolA.Spec.AllowFirstLastIPs = cilium_api_v2alpha1.AllowFirstLastIPNo
 	fixture := mkTestFixture(true, true)
 	fixture.UpsertPool(t, poolA)
 
@@ -1297,6 +1468,101 @@ func TestRequestIPs(t *testing.T) {
 	}
 }
 
+func TestSharedServicesUpdateSharingKeyAndRequestedIP(t *testing.T) {
+	poolA := mkPool(poolAUID, "pool-a", []string{"10.0.10.0/24"})
+	fixture := mkTestFixture(true, false)
+	fixture.UpsertPool(t, poolA)
+
+	svcA := &slim_core_v1.Service{
+		ObjectMeta: slim_meta_v1.ObjectMeta{
+			Name:      "service-a",
+			Namespace: "default",
+			UID:       serviceAUID,
+			Annotations: map[string]string{
+				annotation.LBIPAMIPsKey:     "10.0.10.22",
+				annotation.LBIPAMSharingKey: "key-1",
+			},
+		},
+		Spec: slim_core_v1.ServiceSpec{
+			Type: slim_core_v1.ServiceTypeLoadBalancer,
+			IPFamilies: []slim_core_v1.IPFamily{
+				slim_core_v1.IPv4Protocol,
+			},
+			Ports: []slim_core_v1.ServicePort{{
+				Port: 80,
+			}},
+		},
+	}
+	fixture.UpsertSvc(t, svcA)
+
+	svcB := &slim_core_v1.Service{
+		ObjectMeta: slim_meta_v1.ObjectMeta{
+			Name:      "service-b",
+			Namespace: "default",
+			UID:       serviceAUID,
+			Annotations: map[string]string{
+				annotation.LBIPAMIPsKey:     "10.0.10.33",
+				annotation.LBIPAMSharingKey: "key-2",
+			},
+		},
+		Spec: slim_core_v1.ServiceSpec{
+			Type: slim_core_v1.ServiceTypeLoadBalancer,
+			IPFamilies: []slim_core_v1.IPFamily{
+				slim_core_v1.IPv4Protocol,
+			},
+			Ports: []slim_core_v1.ServicePort{{
+				Port: 81,
+			}},
+		},
+	}
+	fixture.UpsertSvc(t, svcB)
+
+	svcC := &slim_core_v1.Service{
+		ObjectMeta: slim_meta_v1.ObjectMeta{
+			Name:      "service-c",
+			Namespace: "default",
+			UID:       serviceAUID,
+			Annotations: map[string]string{
+				annotation.LBIPAMIPsKey:     "10.0.10.33",
+				annotation.LBIPAMSharingKey: "key-2",
+			},
+		},
+		Spec: slim_core_v1.ServiceSpec{
+			Type: slim_core_v1.ServiceTypeLoadBalancer,
+			IPFamilies: []slim_core_v1.IPFamily{
+				slim_core_v1.IPv4Protocol,
+			},
+			Ports: []slim_core_v1.ServicePort{{
+				Port: 82,
+			}},
+		},
+	}
+	fixture.UpsertSvc(t, svcC)
+
+	svcA = fixture.GetSvc("default", "service-a")
+	svcB = fixture.GetSvc("default", "service-b")
+	svcC = fixture.GetSvc("default", "service-c")
+
+	if svcB.Status.LoadBalancer.Ingress[0].IP != svcC.Status.LoadBalancer.Ingress[0].IP {
+		t.Fatal("IPs of service B & C should be the same")
+	}
+
+	svcC.Annotations[annotation.LBIPAMIPsKey] = "10.0.10.22"
+	svcC.Annotations[annotation.LBIPAMSharingKey] = "key-1"
+
+	fixture.UpsertSvc(t, svcC)
+
+	svcC = fixture.GetSvc("default", "service-c")
+
+	if svcA.Status.LoadBalancer.Ingress[0].IP != svcC.Status.LoadBalancer.Ingress[0].IP {
+		t.Fatal("IPs of service A & C should be the same")
+	}
+
+	if svcB.Status.LoadBalancer.Ingress[0].IP == svcC.Status.LoadBalancer.Ingress[0].IP {
+		t.Error("Expected service B & C to receive a different ingress IP")
+	}
+}
+
 // TestAddPool tests that adding a new pool will satisfy services.
 func TestAddPool(t *testing.T) {
 	poolA := mkPool(poolAUID, "pool-a", []string{"10.0.10.0/24"})
@@ -1360,7 +1626,7 @@ func TestAddRange(t *testing.T) {
 	}
 
 	poolA = fixture.GetPool("pool-a")
-	poolA.Spec.Cidrs = append(poolA.Spec.Cidrs, cilium_api_v2alpha1.CiliumLoadBalancerIPPoolIPBlock{
+	poolA.Spec.Blocks = append(poolA.Spec.Blocks, cilium_api_v2alpha1.CiliumLoadBalancerIPPoolIPBlock{
 		Cidr: "10.0.20.0/24",
 	})
 	fixture.UpsertPool(t, poolA)
@@ -1522,7 +1788,7 @@ func TestRangeDelete(t *testing.T) {
 
 	poolA = fixture.GetPool("pool-a")
 	// Add a new CIDR, this should not have any effect on the existing service.
-	poolA.Spec.Cidrs = append(poolA.Spec.Cidrs, cilium_api_v2alpha1.CiliumLoadBalancerIPPoolIPBlock{
+	poolA.Spec.Blocks = append(poolA.Spec.Blocks, cilium_api_v2alpha1.CiliumLoadBalancerIPPoolIPBlock{
 		Cidr: "10.0.20.0/24",
 	})
 	fixture.UpsertPool(t, poolA)
@@ -1539,7 +1805,7 @@ func TestRangeDelete(t *testing.T) {
 
 	poolA = fixture.GetPool("pool-a")
 	// Remove the existing range, this should trigger the re-allocation of the existing service
-	poolA.Spec.Cidrs = []cilium_api_v2alpha1.CiliumLoadBalancerIPPoolIPBlock{
+	poolA.Spec.Blocks = []cilium_api_v2alpha1.CiliumLoadBalancerIPPoolIPBlock{
 		{
 			Cidr: "10.0.20.0/24",
 		},

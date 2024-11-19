@@ -50,6 +50,10 @@ func LXCMap() *bpf.Map {
 const (
 	// EndpointFlagHost indicates that this endpoint represents the host
 	EndpointFlagHost = 1
+
+	// EndpointFlagAtHostNS indicates that this endpoint is located at the host networking
+	// namespace
+	EndpointFlagAtHostNS = 2
 )
 
 // EndpointFrontend is the interface to implement for an object to synchronize
@@ -62,6 +66,7 @@ type EndpointFrontend interface {
 	IPv4Address() netip.Addr
 	IPv6Address() netip.Addr
 	GetIdentity() identity.NumericIdentity
+	IsAtHostNS() bool
 }
 
 // GetBPFKeys returns all keys which should represent this endpoint in the BPF
@@ -83,22 +88,29 @@ func GetBPFKeys(e EndpointFrontend) []*EndpointKey {
 // BPF endpoints map
 // Must only be called if init() succeeded.
 func GetBPFValue(e EndpointFrontend) (*EndpointInfo, error) {
-	mac, err := e.LXCMac().Uint64()
-	if err != nil {
+	tmp := e.LXCMac()
+	mac, err := tmp.Uint64()
+	if len(tmp) > 0 && err != nil {
 		return nil, fmt.Errorf("invalid LXC MAC: %w", err)
 	}
 
-	nodeMAC, err := e.GetNodeMAC().Uint64()
-	if err != nil {
+	tmp = e.GetNodeMAC()
+	nodeMAC, err := tmp.Uint64()
+	if len(tmp) > 0 && err != nil {
 		return nil, fmt.Errorf("invalid node MAC: %w", err)
 	}
 
+	// Both lxc and node mac can be nil for the case of L3/NOARP devices.
 	info := &EndpointInfo{
 		IfIndex: uint32(e.GetIfIndex()),
 		LxcID:   uint16(e.GetID()),
 		MAC:     mac,
 		NodeMAC: nodeMAC,
 		SecID:   e.GetIdentity().Uint32(), // Host byte-order
+	}
+
+	if e.IsAtHostNS() {
+		info.Flags |= EndpointFlagAtHostNS
 	}
 
 	return info, nil

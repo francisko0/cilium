@@ -65,7 +65,7 @@ func (e *ErrLocalRedirectServiceExists) Is(target error) bool {
 	return e.frontend.DeepEqual(&t.frontend) && e.name == t.name
 }
 
-// healthServer is used to manage HealtCheckNodePort listeners
+// healthServer is used to manage HealthCheckNodePort listeners
 type healthServer interface {
 	UpsertService(svcID lb.ID, svcNS, svcName string, localEndpoints int, port uint16)
 	DeleteService(svcID lb.ID)
@@ -213,7 +213,10 @@ type L7LBInfo struct {
 // 'ports' is typically short for no point optimizing the search.
 func (i *L7LBInfo) isProtoAndPortMatch(fe *lb.L4Addr) bool {
 	// L7 LB redirect is only supported for TCP frontends
-	if fe.Protocol != lb.TCP {
+	// The below is to make sure that UDP and SCTP are not allowed instead of comparing with lb.TCP
+	// The reason is to avoid extra dependencies with ongoing work to differentiate protocols in datapath,
+	// which might add more values such as lb.Any, lb.None, etc.
+	if fe.Protocol == lb.UDP || fe.Protocol == lb.SCTP {
 		return false
 	}
 
@@ -253,7 +256,7 @@ type Service struct {
 	svcByHash map[string]*svcInfo
 	svcByID   map[lb.ID]*svcInfo
 
-	backendRefCount counter.StringCounter
+	backendRefCount counter.Counter[string]
 	// only used to keep track of the existing hash->ID mapping,
 	// not for loadbalancing decisions.
 	backendByHash map[string]*lb.Backend
@@ -271,8 +274,8 @@ type Service struct {
 	backendDiscovery datapathTypes.NodeNeighbors
 }
 
-// NewService creates a new instance of the service handler.
-func NewService(monitorAgent monitorAgent.Agent, lbmap datapathTypes.LBMap, backendDiscoveryHandler datapathTypes.NodeNeighbors) *Service {
+// newService creates a new instance of the service handler.
+func newService(monitorAgent monitorAgent.Agent, lbmap datapathTypes.LBMap, backendDiscoveryHandler datapathTypes.NodeNeighbors) *Service {
 	var localHealthServer healthServer
 	if option.Config.EnableHealthCheckNodePort {
 		localHealthServer = healthserver.New()
@@ -281,7 +284,7 @@ func NewService(monitorAgent monitorAgent.Agent, lbmap datapathTypes.LBMap, back
 	svc := &Service{
 		svcByHash:                map[string]*svcInfo{},
 		svcByID:                  map[lb.ID]*svcInfo{},
-		backendRefCount:          counter.StringCounter{},
+		backendRefCount:          counter.Counter[string]{},
 		backendByHash:            map[string]*lb.Backend{},
 		monitorAgent:             monitorAgent,
 		healthServer:             localHealthServer,
@@ -798,10 +801,6 @@ func (s *Service) upsertService(params *lb.SVC) (bool, lb.ID, error) {
 		backendsCopy = append(backendsCopy, b.DeepCopy())
 	}
 
-	// TODO (Aditi) When we filter backends for LocalRedirect service, there
-	// might be some backend pods with active connections. We may need to
-	// defer filtering the backends list (thereby defer redirecting traffic)
-	// in such cases. GH #12859
 	// Update backends cache and allocate/release backend IDs
 	newBackends, obsoleteBackends, obsoleteSVCBackendIDs, err := s.updateBackendsCacheLocked(svc, backendsCopy)
 	if err != nil {
@@ -836,13 +835,23 @@ func (s *Service) upsertService(params *lb.SVC) (bool, lb.ID, error) {
 			// HealthCheckNodePort is used by external systems to poll the state of the Service,
 			// it should never take into consideration Terminating backends, even when there are only
 			// Terminating backends.
+			//
+			// There is one special case is L7 proxy service, which never have any
+			// backends because the traffic will be redirected.
 			activeBackends := 0
-			for _, b := range backendsCopy {
-				if b.State == lb.BackendStateActive {
-					activeBackends++
+			if l7lbInfo != nil {
+				// Set this to 1 because Envoy will be running in this case.
+				getScopedLog().WithField(logfields.ServiceHealthCheckNodePort, svc.svcHealthCheckNodePort).
+					Debug("L7 service with HealthcheckNodePort enabled")
+				activeBackends = 1
+			} else {
+				for _, b := range backendsCopy {
+					if b.State == lb.BackendStateActive {
+						activeBackends++
+					}
 				}
 			}
-			s.healthServer.UpsertService(lb.ID(svc.frontend.ID), svc.svcName.Namespace, svc.svcName.Name,
+			s.healthServer.UpsertService(svc.frontend.ID, svc.svcName.Namespace, svc.svcName.Name,
 				activeBackends, svc.svcHealthCheckNodePort)
 
 			if err = s.upsertNodePortHealthService(svc, &nodeMetaCollector{}); err != nil {
@@ -1987,10 +1996,6 @@ func (s *Service) deleteBackendsFromCacheLocked(svc *svcInfo) ([]lb.BackendID, [
 func (s *Service) notifyMonitorServiceUpsert(frontend lb.L3n4AddrID, backends []*lb.Backend,
 	svcType lb.SVCType, svcExtTrafficPolicy, svcIntTrafficPolicy lb.SVCTrafficPolicy, svcName, svcNamespace string,
 ) {
-	if s.monitorAgent == nil {
-		return
-	}
-
 	id := uint32(frontend.ID)
 	fe := monitorAPI.ServiceUpsertNotificationAddr{
 		IP:   frontend.AddrCluster.AsNetIP(),
@@ -2011,9 +2016,7 @@ func (s *Service) notifyMonitorServiceUpsert(frontend lb.L3n4AddrID, backends []
 }
 
 func (s *Service) notifyMonitorServiceDelete(id lb.ID) {
-	if s.monitorAgent != nil {
-		s.monitorAgent.SendEvent(monitorAPI.MessageTypeAgent, monitorAPI.ServiceDeleteMessage(uint32(id)))
-	}
+	s.monitorAgent.SendEvent(monitorAPI.MessageTypeAgent, monitorAPI.ServiceDeleteMessage(uint32(id)))
 }
 
 // GetServiceNameByAddr returns namespace and name of the service with a given L3n4Addr. The third

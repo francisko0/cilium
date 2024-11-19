@@ -111,8 +111,9 @@ func (d *Daemon) checkEndpointBPFPrograms(ctx context.Context, p epBPFProgWatchd
 		if err != nil {
 			log.WithField(logfields.Endpoint, ep.HostInterface()).
 				WithField(logfields.EndpointID, ep.ID).
+				WithField(logfields.CEPName, ep.GetK8sNamespaceAndCEPName()).
 				WithError(err).
-				Error("Unable to assert if endpoint BPF programs need to be reloaded")
+				Warn("Unable to assert if endpoint BPF programs need to be reloaded")
 			return err
 		}
 		// We've detected missing bpf progs for this endpoint.
@@ -131,7 +132,7 @@ func (d *Daemon) checkEndpointBPFPrograms(ctx context.Context, p epBPFProgWatchd
 				"Consider investigating whether other software running on this machine is removing Cilium's endpoint BPF programs. " +
 				"If endpoint BPF programs are removed, the associated pods will lose connectivity and only reinstating the programs will restore connectivity.",
 		)
-	wg, err := d.TriggerReloadWithoutCompile(epBPFProgWatchdog)
+	wg, err := d.TriggerReload(epBPFProgWatchdog)
 	if err != nil {
 		log.WithError(err).Error("Failed to reload Cilium endpoints BPF programs")
 	} else {

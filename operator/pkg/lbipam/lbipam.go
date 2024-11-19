@@ -483,13 +483,12 @@ func (ipam *LBIPAM) stripInvalidAllocations(sv *ServiceView) error {
 
 			if len(sharingGroup) == 0 {
 				alloc.Origin.alloc.Free(alloc.IP)
+				ipam.rangesStore.DeleteServiceViewIPForSharingKey(sv.SharingKey, &alloc)
 			} else {
 				alloc.Origin.alloc.Update(alloc.IP, sharingGroup)
 			}
 
 			sv.AllocatedIPs = slices.Delete(sv.AllocatedIPs, allocIdx, allocIdx+1)
-
-			ipam.rangesStore.DeleteServiceViewIPForSharingKey(sv.SharingKey, &alloc)
 
 			return nil
 		}
@@ -517,25 +516,9 @@ func (ipam *LBIPAM) stripInvalidAllocations(sv *ServiceView) error {
 
 		// Check if all AllocatedIPs that are part of a sharing group, if this service is still compatible with them.
 		// If this service is no longer compatible, we have to remove the IP from the sharing group and re-allocate.
-		for _, allocIP := range sv.AllocatedIPs {
-			sharedViews, _ := allocIP.Origin.alloc.Get(allocIP.IP)
-			if len(sharedViews) == 1 {
-				// The allocation isn't shared, we can continue
-				continue
-			}
-
-			compatible := true
-			for _, sharedView := range sharedViews {
-				if sv != sharedView && !sharedView.isCompatible(sv) {
-					compatible = false
-					break
-				}
-			}
-
-			if !compatible {
-				errs = errors.Join(errs, releaseAllocIP())
-				break
-			}
+		if !ipam.checkSharingGroupCompatibility(sv) {
+			errs = errors.Join(errs, releaseAllocIP())
+			continue
 		}
 
 		// If the service is requesting specific IPs
@@ -573,6 +556,26 @@ func (ipam *LBIPAM) stripInvalidAllocations(sv *ServiceView) error {
 	}
 
 	return errs
+}
+
+func (ipam *LBIPAM) checkSharingGroupCompatibility(sv *ServiceView) bool {
+	for _, allocIP := range sv.AllocatedIPs {
+		sharedViews, _ := allocIP.Origin.alloc.Get(allocIP.IP)
+		if len(sharedViews) == 1 {
+			// The allocation isn't shared, we can continue
+			continue
+		}
+
+		for _, sharedView := range sharedViews {
+			if sv != sharedView {
+				if c := sharedView.isCompatible(sv); !c {
+					return false
+				}
+			}
+		}
+	}
+
+	return true
 }
 
 func (ipam *LBIPAM) stripOrImportIngresses(sv *ServiceView) (statusModified bool, err error) {
@@ -649,6 +652,11 @@ func (ipam *LBIPAM) stripOrImportIngresses(sv *ServiceView) (statusModified bool
 				IP:     ip,
 				Origin: lbRange,
 			})
+
+			// If the `ServiceView` has a sharing key, add the IP to the `rangeStore` index
+			if sv.SharingKey != "" {
+				ipam.rangesStore.AddServiceViewIPForSharingKey(sv.SharingKey, &sv.AllocatedIPs[len(sv.AllocatedIPs)-1])
+			}
 		}
 
 		newIngresses = append(newIngresses, ingress)
@@ -736,15 +744,15 @@ func (ipam *LBIPAM) handleDeletedService(svc *slim_core_v1.Service) {
 			alloc.Origin.alloc.Update(alloc.IP, sharingGroupIPs)
 		} else {
 			alloc.Origin.alloc.Free(alloc.IP)
+			// The `ServiceView` has a sharing key, remove the IP from the `rangeStore` index
+			if sv.SharingKey != "" {
+				ipam.rangesStore.DeleteServiceViewIPForSharingKey(sv.SharingKey, &ServiceViewIP{
+					IP:     alloc.IP,
+					Origin: alloc.Origin,
+				})
+			}
 		}
 
-		// The `ServiceView` has a sharing key, remove the IP from the `rangeStore` index
-		if sv.SharingKey != "" {
-			ipam.rangesStore.DeleteServiceViewIPForSharingKey(sv.SharingKey, &ServiceViewIP{
-				IP:     alloc.IP,
-				Origin: alloc.Origin,
-			})
-		}
 	}
 
 	ipam.serviceStore.Delete(key)
@@ -1292,8 +1300,7 @@ func (ipam *LBIPAM) handleNewPool(ctx context.Context, pool *cilium_api_v2alpha1
 	}
 
 	ipam.pools[pool.GetName()] = pool
-	blocks := append(pool.Spec.Cidrs, pool.Spec.Blocks...)
-	for _, ipBlock := range blocks {
+	for _, ipBlock := range pool.Spec.Blocks {
 		from, to, fromCidr, err := ipRangeFromBlock(ipBlock)
 		if err != nil {
 			return fmt.Errorf("Error parsing ip block: %w", err)
@@ -1304,10 +1311,8 @@ func (ipam *LBIPAM) handleNewPool(ctx context.Context, pool *cilium_api_v2alpha1
 			return fmt.Errorf("Error making LB Range for '%s': %w", ipBlock.Cidr, err)
 		}
 
-		// If AllowFirstLastIPs is no or unspecified, mark the first and last IP as allocated upon range creation.
-		if fromCidr && pool.Spec.AllowFirstLastIPs != cilium_api_v2alpha1.AllowFirstLastIPYes {
-			// TODO: in 1.16 switch from default no to default yes.
-			// https://github.com/cilium/cilium/issues/28591
+		// If AllowFirstLastIPs is no, mark the first and last IP as allocated upon range creation.
+		if fromCidr && pool.Spec.AllowFirstLastIPs == cilium_api_v2alpha1.AllowFirstLastIPNo {
 			from, to := lbRange.alloc.Range()
 
 			// If the first and last IPs are the same or adjacent, we would reserve the entire range.
@@ -1357,8 +1362,8 @@ func ipRangeFromBlock(block cilium_api_v2alpha1.CiliumLoadBalancerIPPoolIPBlock)
 func (ipam *LBIPAM) handlePoolModified(ctx context.Context, pool *cilium_api_v2alpha1.CiliumLoadBalancerIPPool) error {
 	changedAllowFirstLastIPs := false
 	if existingPool, ok := ipam.pools[pool.GetName()]; ok {
-		changedAllowFirstLastIPs = (existingPool.Spec.AllowFirstLastIPs == cilium_api_v2alpha1.AllowFirstLastIPYes) !=
-			(pool.Spec.AllowFirstLastIPs == cilium_api_v2alpha1.AllowFirstLastIPYes)
+		changedAllowFirstLastIPs = (existingPool.Spec.AllowFirstLastIPs == cilium_api_v2alpha1.AllowFirstLastIPNo) !=
+			(pool.Spec.AllowFirstLastIPs == cilium_api_v2alpha1.AllowFirstLastIPNo)
 	}
 
 	ipam.pools[pool.GetName()] = pool
@@ -1368,8 +1373,7 @@ func (ipam *LBIPAM) handlePoolModified(ctx context.Context, pool *cilium_api_v2a
 		fromCidr bool
 	}
 	var newRanges []rng
-	blocks := append(pool.Spec.Cidrs, pool.Spec.Blocks...)
-	for _, newBlock := range blocks {
+	for _, newBlock := range pool.Spec.Blocks {
 		from, to, fromCidr, err := ipRangeFromBlock(newBlock)
 		if err != nil {
 			return fmt.Errorf("Error parsing ip block: %w", err)
@@ -1400,9 +1404,7 @@ func (ipam *LBIPAM) handlePoolModified(ctx context.Context, pool *cilium_api_v2a
 		if found {
 			// If the AllowFirstLastIPs state changed
 			if fromCidr && changedAllowFirstLastIPs {
-				// TODO in 1.16 switch from default no to default yes.
-				// https://github.com/cilium/cilium/issues/28591
-				if pool.Spec.AllowFirstLastIPs == cilium_api_v2alpha1.AllowFirstLastIPYes {
+				if pool.Spec.AllowFirstLastIPs != cilium_api_v2alpha1.AllowFirstLastIPNo {
 					// If we are allowing first and last IPs again, free them for allocation
 					from, to := extRange.alloc.Range()
 
@@ -1454,10 +1456,8 @@ func (ipam *LBIPAM) handlePoolModified(ctx context.Context, pool *cilium_api_v2a
 			return fmt.Errorf("Error while making new LB range for range '%s - %s': %w", newRange.from, newRange.to, err)
 		}
 
-		// If AllowFirstLastIPs is no or default, mark the first and last IP as allocated upon range creation.
-		if newRange.fromCidr && pool.Spec.AllowFirstLastIPs != cilium_api_v2alpha1.AllowFirstLastIPYes {
-			// TODO: in 1.16 switch from default no to default yes.
-			// https://github.com/cilium/cilium/issues/28591
+		// If AllowFirstLastIPs is no, mark the first and last IP as allocated upon range creation.
+		if newRange.fromCidr && pool.Spec.AllowFirstLastIPs == cilium_api_v2alpha1.AllowFirstLastIPNo {
 			from, to := newLBRange.alloc.Range()
 
 			// If the first and last IPs are the same or adjacent, we would reserve the entire range.

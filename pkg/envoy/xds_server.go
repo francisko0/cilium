@@ -21,6 +21,7 @@ import (
 	envoy_config_listener "github.com/cilium/proxy/go/envoy/config/listener/v3"
 	envoy_config_route "github.com/cilium/proxy/go/envoy/config/route/v3"
 	envoy_extensions_filters_http_router_v3 "github.com/cilium/proxy/go/envoy/extensions/filters/http/router/v3"
+	envoy_upstream_codec "github.com/cilium/proxy/go/envoy/extensions/filters/http/upstream_codec/v3"
 	envoy_extensions_listener_tls_inspector_v3 "github.com/cilium/proxy/go/envoy/extensions/filters/listener/tls_inspector/v3"
 	envoy_config_http "github.com/cilium/proxy/go/envoy/extensions/filters/network/http_connection_manager/v3"
 	envoy_mongo_proxy "github.com/cilium/proxy/go/envoy/extensions/filters/network/mongo_proxy/v3"
@@ -37,6 +38,7 @@ import (
 	"github.com/cilium/cilium/pkg/bpf"
 	"github.com/cilium/cilium/pkg/completion"
 	"github.com/cilium/cilium/pkg/crypto/certificatemanager"
+	"github.com/cilium/cilium/pkg/endpointstate"
 	_ "github.com/cilium/cilium/pkg/envoy/resource"
 	"github.com/cilium/cilium/pkg/envoy/xds"
 	"github.com/cilium/cilium/pkg/lock"
@@ -44,6 +46,7 @@ import (
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy"
 	"github.com/cilium/cilium/pkg/policy/api"
+	"github.com/cilium/cilium/pkg/promise"
 	"github.com/cilium/cilium/pkg/proxy/endpoint"
 	"github.com/cilium/cilium/pkg/time"
 	"github.com/cilium/cilium/pkg/u8proto"
@@ -75,18 +78,6 @@ const (
 	metricsListenerName   = "envoy-prometheus-metrics-listener"
 	adminListenerName     = "envoy-admin-listener"
 )
-
-type Listener struct {
-	// must hold the xdsServer.mutex when accessing 'count'
-	count uint
-
-	// mutex is needed when accessing the fields below.
-	// xdsServer.mutex is not needed, but if taken it must be taken before 'mutex'
-	mutex   lock.RWMutex
-	acked   bool
-	nacked  bool
-	waiters []*completion.Completion
-}
 
 // XDSServer provides a high-lever interface to manage resources published using the xDS gRPC API.
 type XDSServer interface {
@@ -161,11 +152,11 @@ type xdsServer struct {
 	// Manages it's own locking
 	secretMutator xds.AckingResourceMutator
 
-	// listeners is the set of names of listeners that have been added by
+	// listenerCount is the set of names of listeners that have been added by
 	// calling AddListener.
 	// mutex must be held when accessing this.
 	// Value holds the number of redirects using the listener named by the key.
-	listeners map[string]*Listener
+	listenerCount map[string]uint
 
 	// proxyListeners is the count of redirection proxy listeners in 'listeners'.
 	// When this is zero, cilium should not wait for NACKs/ACKs from envoy.
@@ -188,6 +179,8 @@ type xdsServer struct {
 	// IPCache is used for tracking IP->Identity mappings and propagating
 	// them to the proxy via NPHDS in the cases described
 	ipCache IPCacheEventSource
+
+	restorerPromise promise.Promise[endpointstate.Restorer]
 
 	localEndpointStore *LocalEndpointStore
 }
@@ -215,9 +208,10 @@ type xdsServerConfig struct {
 }
 
 // newXDSServer creates a new xDS GRPC server.
-func newXDSServer(ipCache IPCacheEventSource, localEndpointStore *LocalEndpointStore, config xdsServerConfig) (*xdsServer, error) {
+func newXDSServer(restorerPromise promise.Promise[endpointstate.Restorer], ipCache IPCacheEventSource, localEndpointStore *LocalEndpointStore, config xdsServerConfig) (*xdsServer, error) {
 	return &xdsServer{
-		listeners:          make(map[string]*Listener),
+		restorerPromise:    restorerPromise,
+		listenerCount:      make(map[string]uint),
 		ipCache:            ipCache,
 		localEndpointStore: localEndpointStore,
 
@@ -236,7 +230,7 @@ func (s *xdsServer) start() error {
 
 	resourceConfig := s.initializeXdsConfigs()
 
-	s.stopFunc = startXDSGRPCServer(socketListener, resourceConfig)
+	s.stopFunc = s.startXDSGRPCServer(socketListener, resourceConfig)
 
 	return nil
 }
@@ -351,7 +345,17 @@ func GetCiliumHttpFilter() *envoy_config_http.HttpFilter {
 	}
 }
 
+func GetUpstreamCodecFilter() *envoy_config_http.HttpFilter {
+	return &envoy_config_http.HttpFilter{
+		Name: "envoy.filters.http.upstream_codec",
+		ConfigType: &envoy_config_http.HttpFilter_TypedConfig{
+			TypedConfig: toAny(&envoy_upstream_codec.UpstreamCodec{}),
+		},
+	}
+}
+
 func (s *xdsServer) getHttpFilterChainProto(clusterName string, tls bool, isIngress bool) *envoy_config_listener.FilterChain {
+
 	requestTimeout := int64(s.config.httpRequestTimeout) // seconds
 	idleTimeout := int64(s.config.httpIdleTimeout)       // seconds
 	maxGRPCTimeout := int64(s.config.httpMaxGRPCTimeout) // seconds
@@ -374,6 +378,16 @@ func (s *xdsServer) getHttpFilterChainProto(clusterName string, tls bool, isIngr
 				ConfigType: &envoy_config_http.HttpFilter_TypedConfig{
 					TypedConfig: toAny(&envoy_extensions_filters_http_router_v3.Router{}),
 				},
+			},
+		},
+		InternalAddressConfig: &envoy_config_http.HttpConnectionManager_InternalAddressConfig{
+			UnixSockets: false,
+			CidrRanges: []*envoy_config_core.CidrRange{
+				{AddressPrefix: "10.0.0.0", PrefixLen: &wrapperspb.UInt32Value{Value: 8}},
+				{AddressPrefix: "172.16.0.0", PrefixLen: &wrapperspb.UInt32Value{Value: 12}},
+				{AddressPrefix: "192.168.0.0", PrefixLen: &wrapperspb.UInt32Value{Value: 16}},
+				{AddressPrefix: "127.0.0.1", PrefixLen: &wrapperspb.UInt32Value{Value: 32}},
+				{AddressPrefix: "::1", PrefixLen: &wrapperspb.UInt32Value{Value: 128}},
 			},
 		},
 		StreamIdleTimeout: &durationpb.Duration{}, // 0 == disabled
@@ -749,33 +763,6 @@ func (s *xdsServer) addListener(name string, listenerConf func() *envoy_config_l
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	listener := s.listeners[name]
-	if listener == nil {
-		listener = &Listener{}
-		s.listeners[name] = listener
-		if isProxyListener {
-			s.proxyListeners++
-		}
-	}
-	listener.count++
-	listener.mutex.Lock() // needed for other than 'count'
-	if listener.count > 1 && !listener.nacked {
-		log.Debugf("Envoy: Reusing listener: %s", name)
-		if !listener.acked {
-			// Listener not acked yet, add a completion to the waiter's list
-			log.Debugf("Envoy: Waiting for a non-acknowledged reused listener: %s", name)
-			listener.waiters = append(listener.waiters, wg.AddCompletion())
-		}
-		listener.mutex.Unlock()
-		return
-	}
-	// Try again after a NACK, potentially with a different port number, etc.
-	if listener.nacked {
-		listener.acked = false
-		listener.nacked = false
-	}
-	listener.mutex.Unlock() // Listener locked again in callbacks below
-
 	listenerConfig := listenerConf()
 	if option.Config.EnableBPFTProxy {
 		// Envoy since 1.20.0 uses SO_REUSEPORT on listeners by default.
@@ -785,29 +772,24 @@ func (s *xdsServer) addListener(name string, listenerConf func() *envoy_config_l
 	}
 	if err := listenerConfig.Validate(); err != nil {
 		log.Errorf("Envoy: Could not validate Listener (%s): %s", err, listenerConfig.String())
+		if cb != nil {
+			cb(err)
+		}
 		return
 	}
 
+	count := s.listenerCount[name]
+	if count == 0 {
+		if isProxyListener {
+			s.proxyListeners++
+		}
+		log.WithField(logfields.Listener, name).Infof("Envoy: Upserting new listener")
+	}
+	count++
+	s.listenerCount[name] = count
+
 	s.listenerMutator.Upsert(ListenerTypeURL, name, listenerConfig, []string{"127.0.0.1"}, wg,
 		func(err error) {
-			// listener might have already been removed, so we can't look again
-			// but we still need to complete all the completions in case
-			// someone is still waiting!
-			listener.mutex.Lock()
-			if err == nil {
-				// Allow future users to not need to wait
-				listener.acked = true
-			} else {
-				// Prevent further reuse of a failed listener
-				listener.nacked = true
-			}
-			// Pass the completion result to all the additional waiters.
-			for _, waiter := range listener.waiters {
-				_ = waiter.Complete(err)
-			}
-			listener.waiters = nil
-			listener.mutex.Unlock()
-
 			if cb != nil {
 				cb(err)
 			}
@@ -986,15 +968,18 @@ func (s *xdsServer) removeListener(name string, wg *completion.WaitGroup, isProx
 	var listenerRevertFunc xds.AckingResourceMutatorRevertFunc
 
 	s.mutex.Lock()
-	listener, ok := s.listeners[name]
-	if ok && listener != nil {
-		listener.count--
-		if listener.count == 0 {
+	count := s.listenerCount[name]
+	if count > 0 {
+		count--
+		if count == 0 {
 			if isProxyListener {
 				s.proxyListeners--
 			}
-			delete(s.listeners, name)
+			delete(s.listenerCount, name)
+			log.WithField(logfields.Listener, name).Infof("Envoy: Deleting listener")
 			listenerRevertFunc = s.listenerMutator.Delete(ListenerTypeURL, name, []string{"127.0.0.1"}, wg, nil)
+		} else {
+			s.listenerCount[name] = count
 		}
 	} else {
 		// Bail out if this listener does not exist
@@ -1010,8 +995,7 @@ func (s *xdsServer) removeListener(name string, wg *completion.WaitGroup, isProx
 				s.proxyListeners++
 			}
 		}
-		listener.count++
-		s.listeners[name] = listener
+		s.listenerCount[name] = s.listenerCount[name] + 1
 		s.mutex.Unlock()
 	}
 }
@@ -1312,7 +1296,8 @@ func getHTTPRule(secretManager certificatemanager.SecretManager, h *api.PortRule
 }
 
 var CiliumXDSConfigSource = &envoy_config_core.ConfigSource{
-	ResourceApiVersion: envoy_config_core.ApiVersion_V3,
+	InitialFetchTimeout: &durationpb.Duration{Seconds: 30},
+	ResourceApiVersion:  envoy_config_core.ApiVersion_V3,
 	ConfigSourceSpecifier: &envoy_config_core.ConfigSource_ApiConfigSource{
 		ApiConfigSource: &envoy_config_core.ApiConfigSource{
 			ApiType:                   envoy_config_core.ApiConfigSource_GRPC,
@@ -1581,26 +1566,26 @@ func getDirectionNetworkPolicy(ep endpoint.EndpointUpdater, l4Policy policy.L4Po
 		return SortPortNetworkPolicies(PerPortPolicies)
 	}
 
-	if len(l4Policy) == 0 {
+	if l4Policy == nil || l4Policy.Len() == 0 {
 		return nil
 	}
 
-	PerPortPolicies := make([]*cilium.PortNetworkPolicy, 0, len(l4Policy))
-	for _, l4 := range l4Policy {
+	PerPortPolicies := make([]*cilium.PortNetworkPolicy, 0, l4Policy.Len())
+	l4Policy.ForEach(func(l4 *policy.L4Filter) bool {
 		var protocol envoy_config_core.SocketAddress_Protocol
 		switch l4.Protocol {
 		case api.ProtoTCP:
 			protocol = envoy_config_core.SocketAddress_TCP
 		case api.ProtoUDP, api.ProtoSCTP:
 			// UDP/SCTP rules not sent to Envoy for now.
-			continue
+			return true
 		}
 
-		port := uint16(l4.Port)
+		port := l4.Port
 		if port == 0 && l4.PortName != "" {
 			port = ep.GetNamedPort(l4.Ingress, l4.PortName, uint8(l4.U8Proto))
 			if port == 0 {
-				continue
+				return true // Skip if a named port can not be resolved (yet)
 			}
 		}
 
@@ -1674,15 +1659,18 @@ func getDirectionNetworkPolicy(ep endpoint.EndpointUpdater, l4Policy policy.L4Po
 		// In this case, just don't generate any PortNetworkPolicy for this
 		// port.
 		if !allowAll && len(rules) == 0 {
-			continue
+			return true
 		}
 
+		// NPDS supports port ranges.
 		PerPortPolicies = append(PerPortPolicies, &cilium.PortNetworkPolicy{
 			Port:     uint32(port),
+			EndPort:  uint32(l4.EndPort),
 			Protocol: protocol,
 			Rules:    SortPortNetworkPolicyRules(rules),
 		})
-	}
+		return true
+	})
 
 	if len(PerPortPolicies) == 0 {
 		return nil

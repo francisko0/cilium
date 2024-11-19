@@ -76,6 +76,12 @@ func (r *PodIPPoolReconciler) Priority() int {
 	return 50
 }
 
+func (r *PodIPPoolReconciler) Init(_ *instance.BGPInstance) error {
+	return nil
+}
+
+func (r *PodIPPoolReconciler) Cleanup(_ *instance.BGPInstance) {}
+
 func (r *PodIPPoolReconciler) Reconcile(ctx context.Context, p ReconcileParams) error {
 	if p.DesiredConfig == nil {
 		return fmt.Errorf("BUG: PodIPPoolReconciler reconciler called with nil CiliumBGPNodeConfig")
@@ -107,33 +113,15 @@ func (r *PodIPPoolReconciler) reconcilePaths(ctx context.Context, p ReconcilePar
 	}
 
 	metadata := r.getMetadata(p.BGPInstance)
-	for poolKey, desiredPoolAFPaths := range poolsAFPaths {
-		currentPoolAFPaths, exists := metadata.PoolAFPaths[poolKey]
-		if !exists && len(desiredPoolAFPaths) == 0 {
-			// No paths to reconcile for this pool.
-			continue
-		}
 
-		updatedPoolAFPaths, rErr := ReconcileAFPaths(&ReconcileAFPathsParams{
-			Logger: r.logger.WithFields(
-				logrus.Fields{
-					types.InstanceLogField:  p.DesiredConfig.Name,
-					types.PodIPPoolLogField: poolKey,
-				}),
-			Ctx:          ctx,
-			Instance:     p.BGPInstance,
-			DesiredPaths: desiredPoolAFPaths,
-			CurrentPaths: currentPoolAFPaths,
-		})
+	metadata.PoolAFPaths, err = ReconcileResourceAFPaths(ReconcileResourceAFPathsParams{
+		Logger:                 r.logger.WithField(types.InstanceLogField, p.DesiredConfig.Name),
+		Ctx:                    ctx,
+		Router:                 p.BGPInstance.Router,
+		DesiredResourceAFPaths: poolsAFPaths,
+		CurrentResourceAFPaths: metadata.PoolAFPaths,
+	})
 
-		if rErr == nil && len(desiredPoolAFPaths) == 0 {
-			// No paths left for this pool.
-			delete(metadata.PoolAFPaths, poolKey)
-		} else {
-			metadata.PoolAFPaths[poolKey] = updatedPoolAFPaths
-		}
-		err = errors.Join(err, rErr)
-	}
 	r.setMetadata(p.BGPInstance, metadata)
 	return err
 }
@@ -197,7 +185,7 @@ func (r *PodIPPoolReconciler) reconcileRoutePolicies(ctx context.Context, p Reco
 					types.PodIPPoolLogField: poolKey,
 				}),
 			Ctx:             ctx,
-			Instance:        p.BGPInstance,
+			Router:          p.BGPInstance.Router,
 			DesiredPolicies: desiredRPs,
 			CurrentPolicies: currentRPs,
 		})
@@ -399,7 +387,7 @@ func (r *PodIPPoolReconciler) getPodIPPoolPolicy(p ReconcileParams, peer string,
 		return nil, nil
 	}
 
-	policyName := PolicyName(peer, family.Afi.String(), fmt.Sprintf("%s-%s", pool.Name, pool.Namespace))
+	policyName := PolicyName(peer, family.Afi.String(), advert.AdvertisementType, pool.Name)
 	return CreatePolicy(policyName, peerAddr, v4Prefixes, v6Prefixes, advert)
 }
 

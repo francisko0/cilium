@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
 /* Copyright Authors of Cilium */
 
-#ifndef __BPF_CTX_SKB_H_
-#define __BPF_CTX_SKB_H_
+#pragma once
 
 #define __section_entry __section("tc")
 
@@ -58,9 +57,10 @@
 /* Avoid expensive calls into the kernel flow dissector if it's not an L4
  * hash. We currently only use the hash for debugging. If needed later, we
  * can map it to BPF_FUNC(get_hash_recalc) to get the L4 hash.
+ *
+ * bpf function get_hash_recalc from ../helpers_skb.h
  */
 #define get_hash(ctx)		ctx->hash
-#define get_hash_recalc(ctx)	get_hash(ctx)
 
 #define DEFINE_FUNC_CTX_POINTER(FIELD)						\
 static __always_inline void *							\
@@ -153,5 +153,3 @@ ctx_get_ingress_ifindex(const struct __sk_buff *ctx)
 {
 	return ctx->ingress_ifindex;
 }
-
-#endif /* __BPF_CTX_SKB_H_ */

@@ -2,18 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ARG COMPILERS_IMAGE=quay.io/cilium/image-compilers:5569a29cea6b3ad50aeb03102aaf3dc03841197c@sha256:b15dbedb7c49816c74a765e2f6ecdb9359763b8e4e4328d794f48b9cefae9804
-ARG CILIUM_RUNTIME_IMAGE=quay.io/cilium/cilium-runtime:874a7957a8384b46fb750a151c393eb2503f4b98@sha256:36b0039e76287af586482b0657116266996d502ff7ba5b0ac4a359ba478833b4
+ARG CILIUM_RUNTIME_IMAGE=quay.io/cilium/cilium-runtime:460b815cd09b17e60490b8612a77bcb1d15cefa4@sha256:dba9a5694d90c8bedac3b47fb8a75faef20840ff033b624a8b07f5b82aa60c5e
 ARG TESTER_IMAGE=quay.io/cilium/image-tester:dd09c8d3ef349a909fbcdc99279516baef153f22@sha256:c056d064cb47c97acd607343db5457e1d49d9338d6d8a87e93e23cc93f052c73
-ARG GOLANG_IMAGE=docker.io/library/golang:1.22.3@sha256:b1e05e2c918f52c59d39ce7d5844f73b2f4511f7734add8bb98c9ecdd4443365
+ARG GOLANG_IMAGE=docker.io/library/golang:1.22.9@sha256:4cfe4a9a7ff5817f93e70bcc016ea269401290ec9bd9509b4f0a2dd553640944
 ARG CILIUM_LLVM_IMAGE=quay.io/cilium/cilium-llvm:9f1bfe736009afb1fbb562718bbc42ea07d37d8e@sha256:a666a7a01a2dc610c3ab6e32f25ca5e294201f3cbbc01f233320c527955deee3
 
-FROM ${COMPILERS_IMAGE} as compilers-image
+FROM ${COMPILERS_IMAGE} AS compilers-image
 
-FROM ${GOLANG_IMAGE} as golang-dist
+FROM ${GOLANG_IMAGE} AS golang-dist
 
-FROM ${CILIUM_LLVM_IMAGE} as llvm-dist
+FROM ${CILIUM_LLVM_IMAGE} AS llvm-dist
 
-FROM ${CILIUM_RUNTIME_IMAGE} as rootfs
+FROM ${CILIUM_RUNTIME_IMAGE} AS rootfs
 
 # Change the number to force the generation of a new git-tree SHA. Useful when
 # we want to re-run 'apt-get upgrade' for stale images.
@@ -43,7 +43,8 @@ RUN \
       gcc \
       git \
       libc6-dev \
-      make && \
+      make \
+      ccache && \
     apt-get purge --auto-remove && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
@@ -77,6 +78,11 @@ RUN --mount=type=bind,readwrite,target=/go/src/github.com/cilium/cilium/images/b
 
 # used to facilitate the verifier tests
 COPY --from=llvm-dist /usr/local/bin/llvm-objcopy /bin/
+
+# Create a cache directory with 777 so that we can run the builder image and
+# compile golang code from any UID.
+RUN mkdir -p /.cache && chmod 777 /.cache && \
+    mkdir -p /go/bin && chmod 777 /go/bin
 
 FROM ${TESTER_IMAGE} as test
 COPY --from=rootfs / /

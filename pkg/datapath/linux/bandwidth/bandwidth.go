@@ -10,14 +10,16 @@ package bandwidth
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
-	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/api/resource"
 
 	"github.com/cilium/cilium/pkg/datapath/linux/config/defines"
 	"github.com/cilium/cilium/pkg/datapath/linux/probes"
+	"github.com/cilium/cilium/pkg/datapath/tables"
+	"github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/maps/bwmap"
 )
@@ -27,8 +29,6 @@ const (
 	EgressBandwidth = "kubernetes.io/egress-bandwidth"
 	// IngressBandwidth is the K8s Pod annotation.
 	IngressBandwidth = "kubernetes.io/ingress-bandwidth"
-
-	EnableBBR = "enable-bbr"
 
 	// FqDefaultHorizon represents maximum allowed departure
 	// time delta in future. Given applications can set SO_TXTIME
@@ -69,11 +69,26 @@ func (m *manager) defines() (defines.Map, error) {
 	return cDefinesMap, nil
 }
 
-func (m *manager) DeleteEndpointBandwidthLimit(epID uint16) error {
+func (m *manager) UpdateBandwidthLimit(epID uint16, bytesPerSecond uint64) {
 	if m.enabled {
-		return bwmap.Delete(epID)
+		txn := m.params.DB.WriteTxn(m.params.EdtTable)
+		m.params.EdtTable.Insert(
+			txn,
+			bwmap.NewEdt(epID, bytesPerSecond),
+		)
+		txn.Commit()
 	}
-	return nil
+}
+
+func (m *manager) DeleteBandwidthLimit(epID uint16) {
+	if m.enabled {
+		txn := m.params.DB.WriteTxn(m.params.EdtTable)
+		obj, _, found := m.params.EdtTable.Get(txn, bwmap.EdtIDIndex.Query(epID))
+		if found {
+			m.params.EdtTable.Delete(txn, obj)
+		}
+		txn.Commit()
+	}
 }
 
 func GetBytesPerSec(bandwidth string) (uint64, error) {
@@ -95,8 +110,8 @@ func (m *manager) probe() error {
 	if !m.params.Config.EnableBandwidthManager {
 		return nil
 	}
-	if _, err := m.params.Sysctl.Read("net.core.default_qdisc"); err != nil {
-		m.params.Log.WithError(err).Warn("BPF bandwidth manager could not read procfs. Disabling the feature.")
+	if _, err := m.params.Sysctl.Read([]string{"net", "core", "default_qdisc"}); err != nil {
+		m.params.Log.Warn("BPF bandwidth manager could not read procfs. Disabling the feature.", logfields.Error, err)
 		return nil
 	}
 	if !kernelGood {
@@ -111,7 +126,7 @@ func (m *manager) probe() error {
 		// - https://lpc.events/event/11/contributions/953/
 		// - https://lore.kernel.org/bpf/20220302195519.3479274-1-kafai@fb.com/
 		if probes.HaveProgramHelper(ebpf.SchedCLS, asm.FnSkbSetTstamp) != nil {
-			return fmt.Errorf("cannot enable --%s, needs kernel 5.18 or newer", EnableBBR)
+			return fmt.Errorf("cannot enable --%s, needs kernel 5.18 or newer", types.EnableBBRFlag)
 		}
 	}
 
@@ -122,7 +137,7 @@ func (m *manager) probe() error {
 	}
 
 	if m.params.Config.EnableBandwidthManager && m.params.DaemonConfig.EnableIPSec {
-		m.params.Log.Warning("The bandwidth manager cannot be used with IPSec. Disabling the bandwidth manager.")
+		m.params.Log.Warn("The bandwidth manager cannot be used with IPSec. Disabling the bandwidth manager.")
 		return nil
 	}
 
@@ -145,32 +160,35 @@ func (m *manager) init() error {
 
 func setBaselineSysctls(p bandwidthManagerParams) error {
 	// Ensure interger type sysctls are no smaller than our baseline settings
-	baseIntSettings := map[string]int64{
-		"net.core.netdev_max_backlog":  1000,
-		"net.core.somaxconn":           4096,
-		"net.ipv4.tcp_max_syn_backlog": 4096,
+	baseIntSettings := []struct {
+		name []string
+		val  int64
+	}{
+		{[]string{"net", "core", "netdev_max_backlog"}, 1000},
+		{[]string{"net", "core", "somaxconn"}, 4096},
+		{[]string{"net", "ipv4", "tcp_max_syn_backlog"}, 4096},
 	}
 
-	for name, value := range baseIntSettings {
-		currentValue, err := p.Sysctl.ReadInt(name)
+	for _, setting := range baseIntSettings {
+		currentValue, err := p.Sysctl.ReadInt(setting.name)
 		if err != nil {
-			return fmt.Errorf("read sysctl %s failed: %w", name, err)
+			return fmt.Errorf("read sysctl %s failed: %w", strings.Join(setting.name, "."), err)
 		}
 
-		scopedLog := p.Log.WithFields(logrus.Fields{
-			logfields.SysParamName:  name,
-			logfields.SysParamValue: currentValue,
-			"baselineValue":         value,
-		})
+		scopedLog := p.Log.With(
+			logfields.SysParamName, strings.Join(setting.name, "."),
+			logfields.SysParamValue, currentValue,
+			"baselineValue", setting.val,
+		)
 
-		if currentValue >= value {
+		if currentValue >= setting.val {
 			scopedLog.Info("Skip setting sysctl as it already meets baseline")
 			continue
 		}
 
 		scopedLog.Info("Setting sysctl to baseline for BPF bandwidth manager")
-		if err := p.Sysctl.WriteInt(name, value); err != nil {
-			return fmt.Errorf("set sysctl %s=%d failed: %w", name, value, err)
+		if err := p.Sysctl.WriteInt(setting.name, setting.val); err != nil {
+			return fmt.Errorf("set sysctl %s=%d failed: %w", strings.Join(setting.name, "."), setting.val, err)
 		}
 	}
 
@@ -180,40 +198,21 @@ func setBaselineSysctls(p bandwidthManagerParams) error {
 		congctl = "bbr"
 	}
 
-	baseStringSettings := map[string]string{
-		"net.core.default_qdisc":          "fq",
-		"net.ipv4.tcp_congestion_control": congctl,
-	}
-
-	for name, value := range baseStringSettings {
-		p.Log.WithFields(logrus.Fields{
-			logfields.SysParamName: name,
-			"baselineValue":        value,
-		}).Info("Setting sysctl to baseline for BPF bandwidth manager")
-
-		if err := p.Sysctl.Write(name, value); err != nil {
-			return fmt.Errorf("set sysctl %s=%s failed: %w", name, value, err)
-		}
-	}
-
-	// Extra settings
-	extraSettings := map[string]int64{
-		"net.ipv4.tcp_slow_start_after_idle": 0,
+	sysctls := []tables.Sysctl{
+		{Name: []string{"net", "core", "default_qdisc"}, Val: "fq"},
+		{Name: []string{"net", "ipv4", "tcp_congestion_control"}, Val: congctl},
 	}
 
 	// Few extra knobs which can be turned on along with pacing. EnableBBR
 	// also provides the right kernel dependency implicitly as well.
 	if p.Config.EnableBBR {
-		for name, value := range extraSettings {
-			p.Log.WithFields(logrus.Fields{
-				logfields.SysParamName: name,
-				"baselineValue":        value,
-			}).Info("Setting sysctl to baseline for BPF bandwidth manager")
+		sysctls = append(sysctls, tables.Sysctl{
+			Name: []string{"net", "ipv4", "tcp_slow_start_after_idle"}, Val: "0",
+		})
+	}
 
-			if err := p.Sysctl.WriteInt(name, value); err != nil {
-				return fmt.Errorf("set sysctl %s=%d failed: %w", name, value, err)
-			}
-		}
+	if err := p.Sysctl.ApplySettings(sysctls); err != nil {
+		return fmt.Errorf("failed to apply sysctls: %w", err)
 	}
 
 	return nil

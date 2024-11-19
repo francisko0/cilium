@@ -19,7 +19,7 @@ cilium-agent [flags]
       --allow-icmp-frag-needed                                    Allow ICMP Fragmentation Needed type packets for purposes like TCP Path MTU. (default true)
       --allow-localhost string                                    Policy when to allow local stack to reach local endpoints { auto | always | policy } (default "auto")
       --annotate-k8s-node                                         Annotate Kubernetes node
-      --api-rate-limit stringToString                             API rate limiting configuration (example: --api-rate-limit endpoint-create=rate-limit:10/m,rate-burst:2) (default [])
+      --api-rate-limit string                                     API rate limiting configuration (example: --api-rate-limit endpoint-create=rate-limit:10/m,rate-burst:2)
       --arping-refresh-period duration                            Period for remote node ARP entry refresh (set 0 to disable) (default 30s)
       --auto-create-cilium-node-resource                          Automatically create CiliumNode resource for own node on startup (default true)
       --auto-direct-node-routes                                   Enable automatic L2 routing between nodes
@@ -64,9 +64,9 @@ cilium-agent [flags]
       --cgroup-root string                                        Path to Cgroup2 filesystem
       --cluster-health-port int                                   TCP port for cluster-wide network connectivity health API (default 4240)
       --cluster-id uint32                                         Unique identifier of the cluster
-      --cluster-name string                                       Name of the cluster (default "default")
+      --cluster-name string                                       Name of the cluster. It must consist of at most 32 lower case alphanumeric characters and '-', start and end with an alphanumeric character. (default "default")
       --clustermesh-config string                                 Path to the ClusterMesh configuration directory
-      --clustermesh-ip-identities-sync-timeout duration           Timeout waiting for the initial synchronization of IPs and identities from remote clusters before local endpoints regeneration (default 1m0s)
+      --clustermesh-sync-timeout duration                         Timeout waiting for the initial synchronization of information from remote clusters (default 1m0s)
       --cni-chaining-mode string                                  Enable CNI chaining with the specified plugin (default "none")
       --cni-chaining-target string                                CNI network name into which to insert the Cilium chained configuration. Use '*' to select any network.
       --cni-exclusive                                             Whether to remove other CNI configurations
@@ -79,11 +79,12 @@ cilium-agent [flags]
       --container-ip-local-reserved-ports string                  Instructs the Cilium CNI plugin to reserve the provided comma-separated list of ports in the container network namespace. Prevents the container from using these ports as ephemeral source ports (see Linux ip_local_reserved_ports). Use this flag if you observe port conflicts between transparent DNS proxy requests and host network namespace services. Value "auto" reserves the WireGuard and VXLAN ports used by Cilium (default "auto")
       --controller-group-metrics strings                          List of controller group names for which to to enable metrics. Accepts 'all' and 'none'. The set of controller group names available is not guaranteed to be stable between Cilium versions.
       --crd-wait-timeout duration                                 Cilium will exit if CRDs are not available within this duration upon startup (default 5m0s)
-      --datapath-mode string                                      Datapath mode name (default "veth")
+      --datapath-mode string                                      Datapath mode name (veth, netkit, netkit-l2, lb-only) (default "veth")
   -D, --debug                                                     Enable debugging mode
       --debug-verbose strings                                     List of enabled verbose debug groups
       --devices strings                                           List of devices facing cluster/external network (used for BPF NodePort, BPF masquerading and host firewall); supports '+' as wildcard in device name, e.g. 'eth+'
       --direct-routing-device string                              Device name used to connect nodes in direct routing mode (used by BPF NodePort, BPF host routing; if empty, automatically set to a device with k8s InternalIP/ExternalIP or with a default route)
+      --direct-routing-skip-unreachable                           Enable skipping L2 routes between nodes on different subnets
       --disable-endpoint-crd                                      Disable use of CiliumEndpoint CRD
       --disable-envoy-version-check                               Do not perform Envoy version check
       --disable-external-ip-mitigation                            Disable ExternalIP mitigation (CVE-2020-8554, default false)
@@ -93,10 +94,12 @@ cilium-agent [flags]
       --dnsproxy-concurrency-limit int                            Limit concurrency of DNS message processing
       --dnsproxy-concurrency-processing-grace-period duration     Grace time to wait when DNS proxy concurrent limit has been reached during DNS message processing
       --dnsproxy-enable-transparent-mode                          Enable DNS proxy transparent mode
+      --dnsproxy-socket-linger-timeout int                        Timeout (in seconds) when closing the connection between the DNS proxy and the upstream server. If set to 0, the connection is closed immediately (with TCP RST). If set to -1, the connection is closed asynchronously in the background (default 10)
       --egress-gateway-policy-map-max int                         Maximum number of entries in egress gateway policy map (default 16384)
       --egress-gateway-reconciliation-trigger-interval duration   Time between triggers of egress gateway state reconciliations (default 1s)
       --egress-masquerade-interfaces strings                      Limit iptables-based egress masquerading to interface selector
       --egress-multi-home-ip-rule-compat                          Offset routing table IDs under ENI IPAM mode to avoid collisions with reserved table IDs. If false, the offset is performed (new scheme), otherwise, the old scheme stays in-place.
+      --enable-active-connection-tracking                         Count open and active connections to services, grouped by zones defined in fixed-zone-mapping.
       --enable-auto-protect-node-port-range                       Append NodePort range to net.ipv4.ip_local_reserved_ports if it overlaps with ephemeral port range (net.ipv4.ip_local_port_range) (default true)
       --enable-bandwidth-manager                                  Enable BPF bandwidth manager
       --enable-bbr                                                Enable BBR for the bandwidth manager
@@ -128,7 +131,7 @@ cilium-agent [flags]
       --enable-ip-masq-agent                                      Enable BPF ip-masq-agent
       --enable-ipip-termination                                   Enable plain IPIP/IP6IP6 termination
       --enable-ipsec                                              Enable IPsec support
-      --enable-ipsec-encrypted-overlay                            Enable IPsec encrypted overlay. If enabled tunnel traffic will be encrypted before leaving the host.
+      --enable-ipsec-encrypted-overlay                            Enable IPsec encrypted overlay. If enabled tunnel traffic will be encrypted before leaving the host. Requires ipsec and tunnel mode vxlan to be enabled.
       --enable-ipsec-key-watcher                                  Enable watcher for IPsec key. If disabled, a restart of the agent will be necessary on key rotations. (default true)
       --enable-ipv4                                               Enable IPv4 support (default true)
       --enable-ipv4-big-tcp                                       Enable IPv4 BIG TCP option which increases device's maximum GRO/GSO limits for IPv4
@@ -157,6 +160,7 @@ cilium-agent [flags]
       --enable-pmtu-discovery                                     Enable path MTU discovery to send ICMP fragmentation-needed replies to the client
       --enable-policy string                                      Enable policy enforcement (default "default")
       --enable-recorder                                           Enable BPF datapath pcap recorder
+      --enable-route-mtu-for-cni-chaining                         Enable route MTU for pod netns when CNI chaining is used
       --enable-sctp                                               Enable SCTP support (beta)
       --enable-service-topology                                   Enable support for service topology aware hints
       --enable-session-affinity                                   Enable support for service session affinity
@@ -185,6 +189,7 @@ cilium-agent [flags]
       --exclude-node-label-patterns strings                       List of k8s node label regex patterns to be excluded from CiliumNode
       --external-envoy-proxy                                      whether the Envoy is deployed externally in form of a DaemonSet or not
       --fixed-identity-mapping map                                Key-value for the fixed identity mapping which allows to use reserved label for fixed identities, e.g. 128=kv-store,129=kube-dns
+      --force-device-detection                                    Forces the auto-detection of devices, even if specific devices are explicitly listed
       --gateway-api-secrets-namespace string                      GatewayAPISecretsNamespace is the namespace having tls secrets used by CEC, originating from Gateway API
       --gops-port uint16                                          Port for gops server to listen on (default 9890)
   -h, --help                                                      help for cilium-agent
@@ -195,7 +200,7 @@ cilium-agent [flags]
       --http-retry-count uint                                     Number of retries performed after a forwarded request attempt fails (default 3)
       --http-retry-timeout uint                                   Time after which a forwarded but uncompleted request is retried (connection failures are retried immediately); defaults to 0 (never)
       --hubble-disable-tls                                        Allow Hubble server to run on the given listen address without TLS.
-      --hubble-drop-events                                        Emit packet drop Events related to pods
+      --hubble-drop-events                                        Emit packet drop Events related to pods (alpha)
       --hubble-drop-events-interval duration                      Minimum time between emitting same events (default 2m0s)
       --hubble-drop-events-reasons string                         Drop reasons to emit events for (default "auth_required,policy_denied")
       --hubble-event-buffer-capacity int                          Capacity of Hubble events buffer. The provided value must be one less than an integer power of two and no larger than 65535 (ie: 1, 3, ..., 2047, 4095, ..., 65535) (default 4095)
@@ -228,7 +233,7 @@ cilium-agent [flags]
       --hubble-tls-key-file string                                Path to the private key file for the Hubble server. The file must contain PEM encoded data.
       --identity-allocation-mode string                           Method to use for identity allocation (default "kvstore")
       --identity-change-grace-period duration                     Time to wait before using new identity on endpoint identity change (default 5s)
-      --identity-restore-grace-period duration                    Time to wait before releasing unused restored CIDR identities during agent restart (default 10m0s)
+      --identity-restore-grace-period duration                    Time to wait before releasing unused restored CIDR identities during agent restart (default 30s)
       --ingress-secrets-namespace string                          IngressSecretsNamespace is the namespace having tls secrets used by CEC, originating from Ingress controller
       --install-no-conntrack-iptables-rules                       Install Iptables rules to skip netfilter connection tracking on all pod traffic. This option is only effective when Cilium is running in direct routing and full KPR mode. Moreover, this option cannot be enabled when Cilium is running in a managed Kubernetes environment or in a chained CNI setup.
       --ip-masq-agent-config-path string                          ip-masq-agent configuration file path (default "/etc/config/ip-masq-agent")
@@ -256,6 +261,8 @@ cilium-agent [flags]
       --join-cluster                                              Join a Cilium cluster via kvstore registration
       --k8s-api-server string                                     Kubernetes API server URL
       --k8s-client-burst int                                      Burst value allowed for the K8s client
+      --k8s-client-connection-keep-alive duration                 Configures the keep alive duration of K8s client connections. K8 client is disabled if the value is set to 0 (default 30s)
+      --k8s-client-connection-timeout duration                    Configures the timeout of K8s client connections. K8s client is disabled if the value is set to 0 (default 30s)
       --k8s-client-qps float32                                    Queries per second limit for the K8s client
       --k8s-heartbeat-timeout duration                            Configures the timeout for api-server heartbeat, set to 0 to disable (default 30s)
       --k8s-kubeconfig-path string                                Absolute path of the kubernetes kubeconfig file
@@ -300,6 +307,8 @@ cilium-agent [flags]
       --monitor-queue-size int                                    Size of the event queue when reading monitor events
       --mtu int                                                   Overwrite auto-detected MTU of underlying network
       --multicast-enabled                                         Enables multicast in Cilium
+      --nat-map-stats-entries int                                 Number k top stats entries to store locally in statedb (default 32)
+      --nat-map-stats-interval duration                           Interval upon which nat maps are iterated for stats (default 30s)
       --node-encryption-opt-out-labels string                     Label selector for nodes which will opt-out of node-to-node encryption (default "node-role.kubernetes.io/control-plane")
       --node-labels strings                                       List of label prefixes used to determine identity of a node (used only when enable-node-selector-labels is enabled)
       --node-port-bind-protection                                 Reject application bind(2) requests to service ports in the NodePort range (default true)
@@ -320,6 +329,7 @@ cilium-agent [flags]
       --proxy-connect-timeout uint                                Time after which a TCP connect attempt is considered failed unless completed (in seconds) (default 2)
       --proxy-gid uint                                            Group ID for proxy control plane sockets. (default 1337)
       --proxy-idle-timeout-seconds int                            Set Envoy upstream HTTP idle connection timeout seconds. Does not apply to connections with pending requests. Default 60s (default 60)
+      --proxy-initial-fetch-timeout uint                          Time after which an xDS stream is considered timed out (in seconds) (default 30)
       --proxy-max-connection-duration-seconds int                 Set Envoy HTTP option max_connection_duration seconds. Default 0 (disable)
       --proxy-max-requests-per-connection int                     Set Envoy HTTP option max_requests_per_connection. Default 0 (disable)
       --proxy-portrange-max uint16                                End of port range that is used to allocate ports for L7 proxies. (default 20000)
@@ -329,11 +339,13 @@ cilium-agent [flags]
       --proxy-xff-num-trusted-hops-ingress uint32                 Number of trusted hops regarding the x-forwarded-for and related HTTP headers for the ingress L7 policy enforcement Envoy listeners.
       --read-cni-conf string                                      CNI configuration file to use as a source for --write-cni-conf-when-ready. If not supplied, a suitable one will be generated.
       --restore                                                   Restores state, if possible, from previous daemon (default true)
+      --restored-proxy-ports-age-limit uint                       Time after which a restored proxy ports file is considered stale (in minutes) (default 15)
       --route-metric int                                          Overwrite the metric used by cilium when adding routes to its 'cilium_host' device
       --routing-mode string                                       Routing mode ("native" or "tunnel") (default "tunnel")
       --service-no-backend-response string                        Response to traffic for a service without backends (default "reject")
       --socket-path string                                        Sets daemon's socket path to listen for connections (default "/var/run/cilium/cilium.sock")
       --state-dir string                                          Directory path to store runtime state (default "/var/run/cilium")
+      --static-cnp-path string                                    Directory path to watch and load static cilium network policy yaml files.
       --tofqdns-dns-reject-response-code string                   DNS response code for rejecting DNS requests, available options are '[nameError refused]' (default "refused")
       --tofqdns-enable-dns-compression                            Allow the DNS proxy to compress responses to endpoints that are larger than 512 Bytes or the EDNS0 option, if present (default true)
       --tofqdns-endpoint-max-ip-per-hostname int                  Maximum number of IPs to maintain per FQDN name for each endpoint (default 50)

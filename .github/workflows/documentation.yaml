@@ -5,8 +5,8 @@ on:
   pull_request: {}
   push:
     branches:
-      - main
-      - ft/main/**
+      - v1.16
+      - ft/v1.16/**
   merge_group:
     types: [checks_requested]
 
@@ -19,13 +19,13 @@ concurrency:
 jobs:
   check_changes:
     name: Deduce required tests from code changes
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     outputs:
       docs-tree: ${{ steps.docs-tree.outputs.src }}
     steps:
       - name: Checkout code
         if: ${{ !github.event.pull_request }}
-        uses: actions/checkout@44c2b7a8a4ea60a981eaca3cf939b5f4305c123b # v4.1.5
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -55,14 +55,16 @@ jobs:
     needs: check_changes
     if: ${{ needs.check_changes.outputs.docs-tree == 'true' }}
     name: Validate & Build HTML
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@44c2b7a8a4ea60a981eaca3cf939b5f4305c123b # v4.1.5
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+          # Needed to detect missing redirects
+          fetch-depth: 0
       - name: Build HTML
-        uses: docker://quay.io/cilium/docs-builder:f2d626c9183f87f14c587a8145184b2b71af8639@sha256:eef44b15e3601fb490c57ebf37115e1144bd86b9e571d9c44c762041b4b5874a
+        uses: docker://quay.io/cilium/docs-builder:d09a4f57a38cb603c45944f1b2a9e68333654b71@sha256:1c02ee80fd52ea02f6e5aa52ca063de86b1c69fb78dce285b320c2fa077f505e
         with:
           entrypoint: ./Documentation/check-build.sh
           args: html
@@ -70,17 +72,18 @@ jobs:
   check-generated-documentation:
     name: Check generated documentation
     if: ${{ github.event_name != 'merge_group' }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@44c2b7a8a4ea60a981eaca3cf939b5f4305c123b # v4.1.5
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+          # Needed to detect missing redirects
       - name: Install Go
-        uses: actions/setup-go@cdcb36043654635271a94b9a6d1392de5bb323a7 # v5.0.1
+        uses: actions/setup-go@41dfa10bad2bb2ae585af6ee5bb4d7d973ad74ed # v5.1.0
         with:
           # renovate: datasource=golang-version depName=go
-          go-version: 1.22.3
+          go-version: 1.22.9
 
       # Building Cilium as precondition to generate documentation artifacts.
       - name: Build Cilium

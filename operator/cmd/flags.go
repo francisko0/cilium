@@ -54,14 +54,6 @@ func InitGlobalFlags(cmd *cobra.Command, vp *viper.Viper) {
 	flags.String(option.ConfigDir, "", `Configuration directory that contains a file for each option`)
 	option.BindEnv(vp, option.ConfigDir)
 
-	flags.Float64(operatorOption.CNPStatusCleanupQPS, operatorOption.CNPStatusCleanupQPSDefault,
-		"Rate used for limiting the clean up of the status nodes updates in CNP, expressed as qps")
-	option.BindEnv(vp, operatorOption.CNPStatusCleanupQPS)
-
-	flags.Int(operatorOption.CNPStatusCleanupBurst, operatorOption.CNPStatusCleanupBurstDefault,
-		"Maximum burst of requests to clean up status nodes updates in CNPs")
-	option.BindEnv(vp, operatorOption.CNPStatusCleanupBurst)
-
 	flags.BoolP(option.DebugArg, "D", false, "Enable debugging mode")
 	option.BindEnv(vp, option.DebugArg)
 
@@ -277,6 +269,18 @@ func InitGlobalFlags(cmd *cobra.Command, vp *viper.Viper) {
 	flags.Duration(option.KVstoreLeaseTTL, defaults.KVstoreLeaseTTL, "Time-to-live for the KVstore lease.")
 	flags.MarkHidden(option.KVstoreLeaseTTL)
 	option.BindEnv(vp, option.KVstoreLeaseTTL)
+
+	// Options used for policy validation
+
+	flags.Bool(option.EnableL7Proxy, defaults.EnableL7Proxy, "Enable L7 proxy for L7 policy enforcement")
+	option.BindEnv(vp, option.EnableL7Proxy)
+
+	flags.Bool(option.EnableICMPRules, defaults.EnableICMPRules, "Enable ICMP-based rule support for Cilium Network Policies")
+	flags.MarkHidden(option.EnableICMPRules)
+	option.BindEnv(vp, option.EnableICMPRules)
+
+	flags.Bool(option.EnableNodeSelectorLabels, defaults.EnableNodeSelectorLabels, "Enable use of node label based identity")
+	option.BindEnv(vp, option.EnableNodeSelectorLabels)
 
 	vp.BindPFlags(flags)
 }

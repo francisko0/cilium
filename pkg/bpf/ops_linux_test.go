@@ -102,6 +102,46 @@ func Test_MapOps(t *testing.T) {
 	assert.Len(t, data, 0)
 }
 
+func Test_MapOpsPrune(t *testing.T) {
+	testutils.PrivilegedTest(t)
+
+	// This tests pruning with an LPM trie. This ensures we do not regress, as
+	// previously we had issues with Prune concurrently iterating and deleting
+	// entries, which caused the iteration to skip entries
+	testMap := NewMap(
+		"cilium_ops_prune_test",
+		ebpf.LPMTrie,
+		&TestLPMKey{},
+		&TestValue{},
+		maxEntries,
+		BPF_F_NO_PREALLOC,
+	)
+	err := testMap.OpenOrCreate()
+	require.NoError(t, err, "OpenOrCreate")
+	defer testMap.Close()
+
+	ctx := context.TODO()
+	ops := NewMapOps[*TestObject](testMap)
+
+	// Fill map with similarly prefixed entries
+	err = testMap.Update(&TestLPMKey{32, 0xFF00_00FF}, &TestValue{0})
+	assert.NoError(t, err, "Update 0")
+	err = testMap.Update(&TestLPMKey{32, 0xFF01_01FF}, &TestValue{1})
+	assert.NoError(t, err, "Update 1")
+	err = testMap.Update(&TestLPMKey{32, 0xFF02_02FF}, &TestValue{2})
+	assert.NoError(t, err, "Update 2")
+	err = testMap.Update(&TestLPMKey{32, 0xFF03_03FF}, &TestValue{3})
+	assert.NoError(t, err, "Update 3")
+
+	// Prune should now remove everything
+	err = ops.Prune(ctx, nil, &emptyIterator{})
+	assert.NoError(t, err, "Prune")
+
+	data := map[string][]string{}
+	testMap.Dump(data)
+	assert.Len(t, data, 0)
+}
+
 // Test_MapOps_ReconcilerExample serves as a testable example for the map ops.
 // This is not an "Example*" function as it can only run privileged.
 func Test_MapOps_ReconcilerExample(t *testing.T) {
@@ -132,26 +172,6 @@ func Test_MapOps_ReconcilerExample(t *testing.T) {
 
 	// Create the map operations and the reconciler configuration.
 	ops := NewMapOps[*TestObject](exampleMap)
-	config := reconciler.Config[*TestObject]{
-		Table:                     table,
-		FullReconcilationInterval: time.Minute,
-		RetryBackoffMinDuration:   100 * time.Millisecond,
-		RetryBackoffMaxDuration:   10 * time.Second,
-		IncrementalRoundSize:      1000,
-		GetObjectStatus: func(obj *TestObject) reconciler.Status {
-			return obj.Status
-		},
-		SetObjectStatus: func(obj *TestObject, s reconciler.Status) *TestObject {
-			obj.Status = s
-			return obj
-		},
-		CloneObject: func(obj *TestObject) *TestObject {
-			obj2 := *obj
-			return &obj2
-		},
-		Operations:      ops,
-		BatchOperations: nil,
-	}
 
 	// Silence the hive log output.
 	oldLogLevel := logging.DefaultLogger.GetLevel()
@@ -173,14 +193,27 @@ func Test_MapOps_ReconcilerExample(t *testing.T) {
 					return db.RegisterTable(table)
 				},
 			),
-			cell.Provide(
-				func() reconciler.Config[*TestObject] {
-					return config
-				},
-			),
 			cell.Invoke(
-				reconciler.Register[*TestObject],
-			),
+				func(params reconciler.Params) error {
+					_, err := reconciler.Register[*TestObject](
+						params,
+						table,
+						func(obj *TestObject) *TestObject {
+							obj2 := *obj
+							return &obj2
+						},
+						func(obj *TestObject, s reconciler.Status) *TestObject {
+							obj.Status = s
+							return obj
+						},
+						func(obj *TestObject) reconciler.Status {
+							return obj.Status
+						},
+						ops,
+						nil,
+					)
+					return err
+				}),
 		),
 	)
 

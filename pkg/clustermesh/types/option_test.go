@@ -7,10 +7,15 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
+
+	ipamOption "github.com/cilium/cilium/pkg/ipam/option"
 )
 
 func TestClusterInfoValidate(t *testing.T) {
+	log := logrus.New()
+
 	// this test involves changing the global ClusterIDMax variable, so we need
 	// to save its value and restore it at the end of the test
 	oldMaxClusterID := ClusterIDMax
@@ -63,6 +68,11 @@ func TestClusterInfoValidate(t *testing.T) {
 			wantErr:       true,
 			wantStrictErr: true,
 		},
+		{
+			cinfo:         ClusterInfo{ID: 10, Name: "invAlid", MaxConnectedClusters: 511},
+			wantErr:       false, // Cluster name validation is not yet enforced in Cilium v1.16.
+			wantStrictErr: false, // Cluster name validation is not yet enforced in Cilium v1.16.
+		},
 	}
 
 	for _, tt := range tests {
@@ -75,16 +85,51 @@ func TestClusterInfoValidate(t *testing.T) {
 			}
 
 			if tt.wantErr {
-				assert.Error(t, tt.cinfo.Validate())
+				assert.Error(t, tt.cinfo.Validate(log))
 			} else {
-				assert.NoError(t, tt.cinfo.Validate())
+				assert.NoError(t, tt.cinfo.Validate(log))
 			}
 
 			if tt.wantStrictErr {
-				assert.Error(t, tt.cinfo.ValidateStrict())
+				assert.Error(t, tt.cinfo.ValidateStrict(log))
 			} else {
-				assert.NoError(t, tt.cinfo.ValidateStrict())
+				assert.NoError(t, tt.cinfo.ValidateStrict(log))
 			}
+		})
+	}
+}
+
+func TestClusterInfoValidateBuggyClusterID(t *testing.T) {
+	tests := []struct {
+		cinfo        ClusterInfo
+		ipamMode     string
+		chainingMode string
+		assert       assert.ErrorAssertionFunc
+	}{
+		{cinfo: ClusterInfo{ID: 127}, ipamMode: ipamOption.IPAMClusterPool, chainingMode: "foo", assert: assert.NoError},
+		{cinfo: ClusterInfo{ID: 128}, ipamMode: ipamOption.IPAMClusterPool, chainingMode: "foo", assert: assert.NoError},
+		{cinfo: ClusterInfo{ID: 255}, ipamMode: ipamOption.IPAMClusterPool, chainingMode: "foo", assert: assert.NoError},
+		{cinfo: ClusterInfo{ID: 256}, ipamMode: ipamOption.IPAMClusterPool, chainingMode: "foo", assert: assert.NoError},
+		{cinfo: ClusterInfo{ID: 127}, ipamMode: ipamOption.IPAMENI, assert: assert.NoError},
+		{cinfo: ClusterInfo{ID: 128}, ipamMode: ipamOption.IPAMENI, assert: assert.Error},
+		{cinfo: ClusterInfo{ID: 255}, ipamMode: ipamOption.IPAMAlibabaCloud, assert: assert.Error},
+		{cinfo: ClusterInfo{ID: 256}, ipamMode: ipamOption.IPAMAlibabaCloud, assert: assert.NoError},
+		{cinfo: ClusterInfo{ID: 127}, chainingMode: "aws-cni", assert: assert.NoError},
+		{cinfo: ClusterInfo{ID: 128}, chainingMode: "aws-cni", assert: assert.Error},
+		{cinfo: ClusterInfo{ID: 255}, chainingMode: "aws-cni", assert: assert.Error},
+		{cinfo: ClusterInfo{ID: 256}, chainingMode: "aws-cni", assert: assert.NoError},
+		{cinfo: ClusterInfo{ID: 383}, ipamMode: ipamOption.IPAMClusterPool, chainingMode: "foo", assert: assert.NoError},
+		{cinfo: ClusterInfo{ID: 384}, ipamMode: ipamOption.IPAMClusterPool, chainingMode: "foo", assert: assert.NoError},
+		{cinfo: ClusterInfo{ID: 511}, ipamMode: ipamOption.IPAMClusterPool, chainingMode: "foo", assert: assert.NoError},
+		{cinfo: ClusterInfo{ID: 383}, ipamMode: ipamOption.IPAMENI, chainingMode: "foo", assert: assert.NoError},
+		{cinfo: ClusterInfo{ID: 384}, ipamMode: ipamOption.IPAMENI, chainingMode: "foo", assert: assert.Error},
+		{cinfo: ClusterInfo{ID: 511}, ipamMode: ipamOption.IPAMAlibabaCloud, chainingMode: "foo", assert: assert.Error},
+	}
+
+	for _, tt := range tests {
+		name := fmt.Sprintf("ID: %d, IPAM: %s, Chaining: %s", tt.cinfo.ID, tt.ipamMode, tt.chainingMode)
+		t.Run(name, func(t *testing.T) {
+			tt.assert(t, tt.cinfo.ValidateBuggyClusterID(tt.ipamMode, tt.chainingMode))
 		})
 	}
 }
@@ -92,109 +137,50 @@ func TestClusterInfoValidate(t *testing.T) {
 func TestValidateRemoteConfig(t *testing.T) {
 	tests := []struct {
 		name      string
-		cfg       *CiliumClusterConfig
+		cfg       CiliumClusterConfig
 		mcc       uint32
-		mode      ValidationMode
 		assertion func(t assert.TestingT, err error, msgAndArgs ...interface{}) bool
 	}{
 		{
-			name:      "Nil config (Backward)",
-			cfg:       nil,
+			name:      "Empty config",
+			cfg:       CiliumClusterConfig{},
 			mcc:       255,
-			mode:      BackwardCompatible,
+			assertion: assert.Error,
+		},
+		{
+			name:      "Valid config",
+			cfg:       CiliumClusterConfig{ID: 255, Capabilities: CiliumClusterConfigCapabilities{MaxConnectedClusters: 255}},
+			mcc:       255,
 			assertion: assert.NoError,
 		},
 		{
-			name:      "Nil config (Strict)",
-			cfg:       nil,
+			name:      "Invalid config",
+			cfg:       CiliumClusterConfig{ID: 256},
 			mcc:       255,
-			mode:      Strict,
-			assertion: assert.Error,
-		},
-		{
-			name:      "Empty config (Backward)",
-			cfg:       &CiliumClusterConfig{},
-			mcc:       255,
-			mode:      BackwardCompatible,
-			assertion: assert.NoError,
-		},
-		{
-			name:      "Empty config (Strict)",
-			cfg:       &CiliumClusterConfig{},
-			mcc:       255,
-			mode:      Strict,
-			assertion: assert.Error,
-		},
-		{
-			name:      "Valid config (Backward)",
-			cfg:       &CiliumClusterConfig{ID: 255},
-			mcc:       255,
-			mode:      BackwardCompatible,
-			assertion: assert.NoError,
-		},
-		{
-			name:      "Valid config (Strict)",
-			cfg:       &CiliumClusterConfig{ID: 255, Capabilities: CiliumClusterConfigCapabilities{MaxConnectedClusters: 255}},
-			mcc:       255,
-			mode:      Strict,
-			assertion: assert.NoError,
-		},
-		{
-			name:      "Invalid config (Backward)",
-			cfg:       &CiliumClusterConfig{ID: 256},
-			mcc:       255,
-			mode:      BackwardCompatible,
-			assertion: assert.Error,
-		},
-		{
-			name:      "Invalid config (Strict)",
-			cfg:       &CiliumClusterConfig{ID: 256},
-			mcc:       255,
-			mode:      Strict,
-			assertion: assert.Error,
-		},
-		// Extended ClusterMesh requires CiliumClusterConfig, so use
-		// BackwardCompatible mode for these tests (most permissive)
-		{
-			name:      "Nil config (ClusterMesh511)",
-			cfg:       nil,
-			mcc:       511,
-			mode:      BackwardCompatible,
-			assertion: assert.Error,
-		},
-		{
-			name:      "Empty config (ClusterMesh511)",
-			cfg:       &CiliumClusterConfig{},
-			mcc:       511,
-			mode:      BackwardCompatible,
 			assertion: assert.Error,
 		},
 		{
 			name:      "Invalid config, MaxConnectedClusters mismatch (ClusterMesh255)",
-			cfg:       &CiliumClusterConfig{ID: 511, Capabilities: CiliumClusterConfigCapabilities{MaxConnectedClusters: 511}},
+			cfg:       CiliumClusterConfig{ID: 511, Capabilities: CiliumClusterConfigCapabilities{MaxConnectedClusters: 511}},
 			mcc:       255,
-			mode:      BackwardCompatible,
 			assertion: assert.Error,
 		},
 		{
 			name:      "Valid config (ClusterMesh511)",
-			cfg:       &CiliumClusterConfig{ID: 511, Capabilities: CiliumClusterConfigCapabilities{MaxConnectedClusters: 511}},
+			cfg:       CiliumClusterConfig{ID: 511, Capabilities: CiliumClusterConfigCapabilities{MaxConnectedClusters: 511}},
 			mcc:       511,
-			mode:      BackwardCompatible,
 			assertion: assert.NoError,
 		},
 		{
 			name:      "Invalid config, MaxConnectedClusters mismatch (ClusterMesh511)",
-			cfg:       &CiliumClusterConfig{ID: 511, Capabilities: CiliumClusterConfigCapabilities{MaxConnectedClusters: 255}},
+			cfg:       CiliumClusterConfig{ID: 511, Capabilities: CiliumClusterConfigCapabilities{MaxConnectedClusters: 255}},
 			mcc:       511,
-			mode:      BackwardCompatible,
 			assertion: assert.Error,
 		},
 		{
 			name:      "Invalid config (ClusterMesh511)",
-			cfg:       &CiliumClusterConfig{ID: 512, Capabilities: CiliumClusterConfigCapabilities{MaxConnectedClusters: 511}},
+			cfg:       CiliumClusterConfig{ID: 512, Capabilities: CiliumClusterConfigCapabilities{MaxConnectedClusters: 511}},
 			mcc:       511,
-			mode:      BackwardCompatible,
 			assertion: assert.Error,
 		},
 	}
@@ -203,9 +189,9 @@ func TestValidateRemoteConfig(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cinfo := ClusterInfo{MaxConnectedClusters: tt.mcc}
 			// ClusterIDMax needs to be initialized here. This is ordinarily
-			// executed during agent intialization.
+			// executed during agent initialization.
 			cinfo.InitClusterIDMax()
-			tt.assertion(t, cinfo.ValidateRemoteConfig(bool(tt.mode), tt.cfg))
+			tt.assertion(t, cinfo.ValidateRemoteConfig(tt.cfg))
 		})
 	}
 }

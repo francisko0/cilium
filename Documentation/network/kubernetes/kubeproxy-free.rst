@@ -603,6 +603,7 @@ mode would look as follows:
         --set k8sServiceHost=${API_SERVER_IP} \\
         --set k8sServicePort=${API_SERVER_PORT}
 
+.. _socketlb-host-netns-only:
 
 Socket LoadBalancer Bypass in Pod Namespace
 *******************************************
@@ -1340,13 +1341,18 @@ working, take a look at `this KEP
     free mode, make sure that default Kubernetes services like ``kube-dns`` and ``kubernetes``
     have the required label value.
 
-Topology Aware Hints
-********************
+Traffic Distribution and Topology Aware Hints
+*********************************************
 
-The kube-proxy replacement implements the K8s service
-`Topology Aware Hints <https://kubernetes.io/docs/concepts/services-networking/topology-aware-hints>`__.
-This allows Cilium nodes to prefer service endpoints residing in the same zone.
-To enable the feature, set ``loadBalancer.serviceTopology=true``.
+The kube-proxy replacement implements both Kubernetes `Topology Aware Routing
+<https://kubernetes.io/docs/concepts/services-networking/topology-aware-routing>`__,
+and the more recent `Traffic Distribution
+<https://kubernetes.io/docs/concepts/services-networking/service/#traffic-distribution>`__
+features.
+
+Both of these features work by setting ``hints`` on EndpointSlices that enable
+Cilium to route to endpoints residing in the same zone. To enable the feature,
+set ``loadBalancer.serviceTopology=true``.
 
 Neighbor Discovery
 ******************
@@ -1498,7 +1504,7 @@ and selected service endpoint.
     Jan 13 13:47:20.932: default/mediabot:38750 (ID:5618) <> default/nginx (ID:35772) pre-xlate-rev TRACED (TCP)
 
 Socket LB tracing with Hubble requires cilium agent to detect pod cgroup paths.
-If you see a warning message in cilium agent ``No valid cgroup base path found: socket load-balancing tracing with Hubble will not work.``,
+If you see a warning message in cilium agent ``Failed to setup socket load-balancing tracing with Hubble.``,
 you can trace packets using ``cilium-dbg monitor`` instead.
 
 .. note::
@@ -1631,14 +1637,10 @@ Limitations
       device changes.
     * When socket-LB feature is enabled, pods sending (connected) UDP traffic to services
       can continue to send traffic to a service backend even after it's deleted. Cilium agent
-      handles such scenarios by forcefully terminating pod sockets in the host network
-      namespace that are connected to deleted backends, so that the pods can be
-      load-balanced to active backends. This functionality requires these
-      kernel configs to be enabled: ``CONFIG_INET_DIAG``, ``CONFIG_INET_UDP_DIAG``
-      and ``CONFIG_INET_DIAG_DESTROY``. If you have application pods (not deployed in the
-      host network namespace) making long-lived connections using (connected) UDP,
-      you can enable ``bpf-lb-sock-hostns-only`` in order to enable the socket-LB
-      feature only in the host network namespace.
+      handles such scenarios by forcefully terminating application sockets that are connected
+      to deleted backends, so that the applications can be load-balanced to active backends.
+      This functionality requires these kernel configs to be enabled:
+      ``CONFIG_INET_DIAG``, ``CONFIG_INET_UDP_DIAG`` and ``CONFIG_INET_DIAG_DESTROY``.
     * Cilium's BPF-based masquerading is recommended over iptables when using the
       BPF-based NodePort. Otherwise, there is a risk for port collisions between
       BPF and iptables SNAT, which might result in dropped NodePort

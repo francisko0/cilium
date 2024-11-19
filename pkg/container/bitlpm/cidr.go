@@ -6,6 +6,7 @@ package bitlpm
 import (
 	"math/bits"
 	"net/netip"
+	"unsafe"
 )
 
 // CIDRTrie can hold both IPv4 and IPv6 prefixes
@@ -23,25 +24,31 @@ func NewCIDRTrie[T any]() *CIDRTrie[T] {
 	}
 }
 
-// Lookup returns the longest matched value for a given address.
-func (c *CIDRTrie[T]) Lookup(addr netip.Addr) (T, bool) {
+// ExactLookup returns the value for a given CIDR, but only
+// if there is an exact match for the CIDR in the Trie.
+func (c *CIDRTrie[T]) ExactLookup(cidr netip.Prefix) (T, bool) {
+	return c.treeForFamily(cidr).ExactLookup(uint(cidr.Bits()), cidrKey(cidr))
+}
+
+// LongestPrefixMatch returns the longest matched value for a given address.
+func (c *CIDRTrie[T]) LongestPrefixMatch(addr netip.Addr) (T, bool) {
 	if !addr.IsValid() {
 		var def T
 		return def, false
 	}
 	bits := addr.BitLen()
 	prefix := netip.PrefixFrom(addr, bits)
-	return c.treeForFamily(prefix).Lookup(cidrKey(prefix))
+	return c.treeForFamily(prefix).LongestPrefixMatch(cidrKey(prefix))
 }
 
-// Ancestors iterates over every prefix-key pair that contains the prefix-key argument pair.
+// Ancestors iterates over every CIDR pair that contains the CIDR argument.
 func (c *CIDRTrie[T]) Ancestors(cidr netip.Prefix, fn func(k netip.Prefix, v T) bool) {
 	c.treeForFamily(cidr).Ancestors(uint(cidr.Bits()), cidrKey(cidr), func(prefix uint, k Key[netip.Prefix], v T) bool {
 		return fn(k.Value(), v)
 	})
 }
 
-// Descendants iterates over every prefix-key pair that is contained by the prefix-key argument pair.
+// Descendants iterates over every CIDR that is contained by the CIDR argument.
 func (c *CIDRTrie[T]) Descendants(cidr netip.Prefix, fn func(k netip.Prefix, v T) bool) {
 	c.treeForFamily(cidr).Descendants(uint(cidr.Bits()), cidrKey(cidr), func(prefix uint, k Key[netip.Prefix], v T) bool {
 		return fn(k.Value(), v)
@@ -96,25 +103,33 @@ func (k cidrKey) Value() netip.Prefix {
 }
 
 func (k cidrKey) BitValueAt(idx uint) uint8 {
-	bytes := netip.Prefix(k).Addr().AsSlice()
-	byt := bytes[idx/8]
-	if byt&(1<<(7-(idx%8))) == 0 {
-		return 0
+	addr := netip.Prefix(k).Addr()
+	if addr.Is4() {
+		word := (*(*[2]uint64)(unsafe.Pointer(&addr)))[1]
+		return uint8((word >> (31 - idx)) & 1)
 	}
-	return 1
+	if idx < 64 {
+		word := (*(*[2]uint64)(unsafe.Pointer(&addr)))[0]
+		return uint8((word >> (63 - idx)) & 1)
+	} else {
+		word := (*(*[2]uint64)(unsafe.Pointer(&addr)))[1]
+		return uint8((word >> (127 - idx)) & 1)
+	}
 }
 
 func (k cidrKey) CommonPrefix(k2 netip.Prefix) uint {
-	out := uint(0)
-	b1 := k.Value().Addr().AsSlice()
-	b2 := k2.Addr().AsSlice()
-
-	for i := range b1 {
-		v := bits.LeadingZeros8(b1[i] ^ b2[i])
-		out += uint(v)
-		if v != 8 {
-			break
-		}
+	addr1 := netip.Prefix(k).Addr()
+	addr2 := k2.Addr()
+	words1 := (*[2]uint64)(unsafe.Pointer(&addr1))
+	words2 := (*[2]uint64)(unsafe.Pointer(&addr2))
+	if addr1.Is4() {
+		word1 := uint32((*words1)[1])
+		word2 := uint32((*words2)[1])
+		return uint(bits.LeadingZeros32(word1 ^ word2))
 	}
-	return out
+	v := bits.LeadingZeros64((*words1)[0] ^ (*words2)[0])
+	if v == 64 {
+		v += bits.LeadingZeros64((*words1)[1] ^ (*words2)[1])
+	}
+	return uint(v)
 }

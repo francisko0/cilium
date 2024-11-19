@@ -7,12 +7,15 @@ import (
 	"github.com/cilium/hive/cell"
 	"github.com/spf13/pflag"
 
+	"github.com/cilium/cilium/pkg/controller"
 	"github.com/cilium/cilium/pkg/datapath/iptables"
 	"github.com/cilium/cilium/pkg/envoy"
 	monitoragent "github.com/cilium/cilium/pkg/monitor/agent"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/proxy/logger"
 	"github.com/cilium/cilium/pkg/proxy/logger/endpoint"
+	"github.com/cilium/cilium/pkg/time"
+	"github.com/cilium/cilium/pkg/trigger"
 )
 
 // Cell provides the L7 Proxy which provides support for L7 network policies.
@@ -30,18 +33,21 @@ var Cell = cell.Module(
 )
 
 type ProxyConfig struct {
-	ProxyPortrangeMin uint16
-	ProxyPortrangeMax uint16
+	ProxyPortrangeMin          uint16
+	ProxyPortrangeMax          uint16
+	RestoredProxyPortsAgeLimit uint
 }
 
 func (r ProxyConfig) Flags(flags *pflag.FlagSet) {
 	flags.Uint16("proxy-portrange-min", 10000, "Start of port range that is used to allocate ports for L7 proxies.")
 	flags.Uint16("proxy-portrange-max", 20000, "End of port range that is used to allocate ports for L7 proxies.")
+	flags.Uint("restored-proxy-ports-age-limit", 15, "Time after which a restored proxy ports file is considered stale (in minutes)")
 }
 
 type proxyParams struct {
 	cell.In
 
+	Lifecycle             cell.Lifecycle
 	Config                ProxyConfig
 	IPTablesManager       *iptables.Manager
 	EndpointInfoRegistry  logger.EndpointInfoRegistry
@@ -61,7 +67,44 @@ func newProxy(params proxyParams) *Proxy {
 
 	configureProxyLogger(params.EndpointInfoRegistry, params.MonitorAgent, option.Config.AgentLabels)
 
-	return createProxy(params.Config.ProxyPortrangeMin, params.Config.ProxyPortrangeMax, params.IPTablesManager, params.EnvoyProxyIntegration, params.DNSProxyIntegration)
+	p := createProxy(params.Config.ProxyPortrangeMin, params.Config.ProxyPortrangeMax, params.IPTablesManager, params.EnvoyProxyIntegration, params.DNSProxyIntegration)
+
+	triggerDone := make(chan struct{})
+
+	controllerManager := controller.NewManager()
+	controllerGroup := controller.NewGroup("proxy-ports-allocator")
+	controllerName := "proxy-ports-checkpoint"
+
+	params.Lifecycle.Append(cell.Hook{
+		OnStart: func(cell.HookContext) (err error) {
+			// Restore all proxy ports before we create the trigger to overwrite the
+			// file below
+			p.RestoreProxyPorts(params.Config.RestoredProxyPortsAgeLimit)
+
+			p.proxyPortsTrigger, err = trigger.NewTrigger(trigger.Parameters{
+				MinInterval: 10 * time.Second,
+				TriggerFunc: func(reasons []string) {
+					controllerManager.UpdateController(controllerName, controller.ControllerParams{
+						Group:    controllerGroup,
+						DoFunc:   p.storeProxyPorts,
+						StopFunc: p.storeProxyPorts, // perform one last checkpoint when the controller is removed
+					})
+				},
+				ShutdownFunc: func() {
+					controllerManager.RemoveControllerAndWait(controllerName) // waits for StopFunc
+					close(triggerDone)
+				},
+			})
+			return err
+		},
+		OnStop: func(cell.HookContext) error {
+			p.proxyPortsTrigger.Shutdown()
+			<-triggerDone
+			return nil
+		},
+	})
+
+	return p
 }
 
 type envoyProxyIntegrationParams struct {

@@ -131,6 +131,10 @@ func TestVerifier(t *testing.T) {
 			macroName: "MAX_HOST_OPTIONS",
 		},
 		{
+			name:      "bpf_wireguard",
+			macroName: "MAX_WIREGUARD_OPTIONS",
+		},
+		{
 			name:      "bpf_xdp",
 			macroName: "MAX_XDP_OPTIONS",
 		},
@@ -208,16 +212,18 @@ func TestVerifier(t *testing.T) {
 						m.Pinning = ebpf.PinNone
 					}
 
-					coll, err := bpf.LoadCollection(spec, ebpf.CollectionOptions{
-						// Enable verifier logs for successful loads.
-						// Use log level 1 since it's known by all target kernels.
-						Programs: ebpf.ProgramOptions{
-							// Maximum log size for kernels <5.2. Some programs generate a
-							// verifier log of over 8MiB, so avoid retries due to the initial
-							// size being too small. This saves a lot of time as retrying means
-							// reloading all maps and progs in the collection.
-							LogSize:  (math.MaxUint32 >> 8), // 16MiB
-							LogLevel: ebpf.LogLevelBranch,
+					coll, _, err := bpf.LoadCollection(spec, &bpf.CollectionOptions{
+						CollectionOptions: ebpf.CollectionOptions{
+							// Enable verifier logs for successful loads.
+							// Use log level 1 since it's known by all target kernels.
+							Programs: ebpf.ProgramOptions{
+								// Maximum log size for kernels <5.2. Some programs generate a
+								// verifier log of over 8MiB, so avoid retries due to the initial
+								// size being too small. This saves a lot of time as retrying means
+								// reloading all maps and progs in the collection.
+								LogSize:  (math.MaxUint32 >> 8), // 16MiB
+								LogLevel: ebpf.LogLevelBranch,
+							},
 						},
 					})
 					var ve *ebpf.VerifierError

@@ -574,8 +574,9 @@ func TestDecodeTraceReason(t *testing.T) {
 			want:   flowpb.TraceReason_RELATED,
 		},
 		{
+			// "reopened" is deprecated, as the datapath no longer returns it
 			name:   "reopened",
-			reason: monitor.TraceReasonCtReopened,
+			reason: monitor.TraceReasonCtDeprecatedReopened,
 			want:   flowpb.TraceReason_REOPENED,
 		},
 		{
@@ -663,6 +664,7 @@ func TestDecodeTrafficDirection(t *testing.T) {
 	policyKey := policyTypes.Key{
 		Identity:         remoteID,
 		DestPort:         0,
+		InvertedPortMask: 0xffff, // this is a wildcard
 		Nexthdr:          0,
 		TrafficDirection: trafficdirection.Egress.Uint8(),
 	}
@@ -860,6 +862,7 @@ func TestDecodeTrafficDirection(t *testing.T) {
 	assert.Equal(t, true, ok)
 	lbls, rev, ok := ep.GetRealizedPolicyRuleLabelsForKey(policyTypes.Key{
 		Identity:         f.GetDestination().GetIdentity(),
+		InvertedPortMask: 0xffff, // this is a wildcard
 		TrafficDirection: directionFromProto(f.GetTrafficDirection()).Uint8(),
 	})
 	assert.Equal(t, true, ok)
@@ -1208,8 +1211,15 @@ func TestTraceNotifyLocalEndpoint(t *testing.T) {
 		Identity:     4567,
 		IPv4:         net.ParseIP("1.1.1.1"),
 		PodName:      "xwing",
-		PodNamespace: "default",
-		Labels:       []string{"a", "b", "c"},
+		PodNamespace: "kube-system",
+		Labels: []string{
+			"k8s:io.cilium.k8s.policy.cluster=default",
+			"k8s:io.kubernetes.pod.namespace=kube-system",
+			"k8s:io.cilium.k8s.namespace.labels.kubernetes.io/metadata.name=kube-system",
+			"k8s:org=alliance",
+			"k8s:class=xwing",
+			"k8s:app.kubernetes.io/name=xwing",
+		},
 	}
 	endpointGetter := &testutils.FakeEndpointGetter{
 		OnGetEndpointInfo: func(ip netip.Addr) (endpoint getters.EndpointInfo, ok bool) {
@@ -1244,8 +1254,9 @@ func TestTraceNotifyLocalEndpoint(t *testing.T) {
 
 	assert.Equal(t, uint32(ep.ID), f.Source.ID)
 	assert.Equal(t, uint32(v0.SrcLabel), f.Source.Identity)
+	assert.Equal(t, "default", f.GetSource().GetClusterName())
 	assert.Equal(t, ep.PodNamespace, f.Source.Namespace)
-	assert.Equal(t, ep.Labels, f.Source.Labels)
+	assert.Equal(t, common.SortAndFilterLabels(log, ep.Labels, ep.Identity), f.Source.Labels)
 	assert.Equal(t, ep.PodName, f.Source.PodName)
 }
 

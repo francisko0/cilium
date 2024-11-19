@@ -26,7 +26,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 
 	"github.com/cilium/cilium/operator/pkg/model"
 	"github.com/cilium/cilium/operator/pkg/model/translation"
@@ -49,9 +49,7 @@ var (
 	routeActionBackendV3 = toRouteAction("gateway-conformance-infra", "infra-backend-v3", "8080")
 )
 
-var (
-	backendProtocolH2CAppProtocol = translation.AppProtocolH2C
-)
+var backendProtocolH2CAppProtocol = translation.AppProtocolH2C
 
 var httpInsecureListenerXDSResource = toAny(&envoy_config_listener.Listener{
 	Name: "listener",
@@ -136,6 +134,16 @@ func buildHTTPInsecureListenerXDSResourceWithXFF(routeName string, xffNumTrusted
 								UseRemoteAddress:  &wrapperspb.BoolValue{Value: true},
 								SkipXffAppend:     false,
 								XffNumTrustedHops: xffNumTrustedHops,
+								InternalAddressConfig: &http_connection_manager_v3.HttpConnectionManager_InternalAddressConfig{
+									UnixSockets: false,
+									CidrRanges: []*envoy_config_core_v3.CidrRange{
+										{AddressPrefix: "10.0.0.0", PrefixLen: &wrapperspb.UInt32Value{Value: 8}},
+										{AddressPrefix: "172.16.0.0", PrefixLen: &wrapperspb.UInt32Value{Value: 12}},
+										{AddressPrefix: "192.168.0.0", PrefixLen: &wrapperspb.UInt32Value{Value: 16}},
+										{AddressPrefix: "127.0.0.1", PrefixLen: &wrapperspb.UInt32Value{Value: 32}},
+										{AddressPrefix: "::1", PrefixLen: &wrapperspb.UInt32Value{Value: 128}},
+									},
+								},
 								HttpFilters: []*http_connection_manager_v3.HttpFilter{
 									{
 										Name: "envoy.filters.http.grpc_web",
@@ -226,7 +234,7 @@ func basicHTTPListeners(port uint32) []model.HTTPListener {
 					Name:      "my-gateway",
 					Namespace: "default",
 					Group:     "gateway.networking.k8s.io",
-					Version:   "v1beta1",
+					Version:   "v1",
 					Kind:      "Gateway",
 				},
 			},
@@ -259,7 +267,8 @@ var basicHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 		Name:      "cilium-gateway-my-gateway",
 		Namespace: "default",
 		Labels: map[string]string{
-			"cilium.io/use-original-source-address": "false",
+			"cilium.io/use-original-source-address":  "false",
+			"gateway.networking.k8s.io/gateway-name": "my-gateway",
 		},
 		OwnerReferences: []metav1.OwnerReference{
 			{
@@ -275,6 +284,9 @@ var basicHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 			{
 				Name:      "cilium-gateway-my-gateway",
 				Namespace: "default",
+				Ports: []uint16{
+					80,
+				},
 			},
 		},
 		BackendServices: []*ciliumv2.Service{
@@ -318,7 +330,8 @@ var basicHTTPListenersCiliumEnvoyConfigWithXff = &ciliumv2.CiliumEnvoyConfig{
 		Name:      "cilium-gateway-my-gateway",
 		Namespace: "default",
 		Labels: map[string]string{
-			"cilium.io/use-original-source-address": "false",
+			"cilium.io/use-original-source-address":  "false",
+			"gateway.networking.k8s.io/gateway-name": "my-gateway",
 		},
 		OwnerReferences: []metav1.OwnerReference{
 			{
@@ -334,6 +347,9 @@ var basicHTTPListenersCiliumEnvoyConfigWithXff = &ciliumv2.CiliumEnvoyConfig{
 			{
 				Name:      "cilium-gateway-my-gateway",
 				Namespace: "default",
+				Ports: []uint16{
+					80,
+				},
 			},
 		},
 		BackendServices: []*ciliumv2.Service{
@@ -378,7 +394,8 @@ func basicHostPortHTTPListenersCiliumEnvoyConfig(address string, port uint32, no
 			Name:      "cilium-gateway-my-gateway",
 			Namespace: "default",
 			Labels: map[string]string{
-				"cilium.io/use-original-source-address": "false",
+				"cilium.io/use-original-source-address":  "false",
+				"gateway.networking.k8s.io/gateway-name": "my-gateway",
 			},
 			OwnerReferences: []metav1.OwnerReference{
 				{
@@ -395,6 +412,9 @@ func basicHostPortHTTPListenersCiliumEnvoyConfig(address string, port uint32, no
 				{
 					Name:      "cilium-gateway-my-gateway",
 					Namespace: "default",
+					Ports: []uint16{
+						uint16(port),
+					},
 				},
 			},
 			BackendServices: []*ciliumv2.Service{
@@ -442,7 +462,7 @@ var basicTLSListeners = []model.TLSPassthroughListener{
 				Name:      "my-gateway",
 				Namespace: "default",
 				Group:     "gateway.networking.k8s.io",
-				Version:   "v1alpha2",
+				Version:   "v1",
 				Kind:      "Gateway",
 			},
 		},
@@ -471,7 +491,8 @@ var basicTLSListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 		Name:      "cilium-gateway-my-gateway",
 		Namespace: "default",
 		Labels: map[string]string{
-			"cilium.io/use-original-source-address": "false",
+			"cilium.io/use-original-source-address":  "false",
+			"gateway.networking.k8s.io/gateway-name": "my-gateway",
 		},
 		OwnerReferences: []metav1.OwnerReference{
 			{
@@ -487,6 +508,9 @@ var basicTLSListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 			{
 				Name:      "cilium-gateway-my-gateway",
 				Namespace: "default",
+				Ports: []uint16{
+					443,
+				},
 			},
 		},
 		BackendServices: []*ciliumv2.Service{
@@ -558,9 +582,11 @@ var simpleSameNamespaceHTTPListeners = []model.HTTPListener{
 		Name: "http",
 		Sources: []model.FullyQualifiedResource{
 			{
-				Kind:      "Gateway",
 				Name:      "same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Group:     "gateway.networking.k8s.io",
+				Version:   "v1",
+				Kind:      "Gateway",
 			},
 		},
 		Port:     80,
@@ -586,7 +612,8 @@ var simpleSameNamespaceHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyCon
 		Name:      "cilium-gateway-same-namespace",
 		Namespace: "gateway-conformance-infra",
 		Labels: map[string]string{
-			"cilium.io/use-original-source-address": "false",
+			"cilium.io/use-original-source-address":  "false",
+			"gateway.networking.k8s.io/gateway-name": "same-namespace",
 		},
 		OwnerReferences: []metav1.OwnerReference{
 			{
@@ -602,6 +629,9 @@ var simpleSameNamespaceHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyCon
 			{
 				Name:      "cilium-gateway-same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Ports: []uint16{
+					80,
+				},
 			},
 		},
 		BackendServices: []*ciliumv2.Service{
@@ -645,9 +675,11 @@ var backendProtocolDisabledH2CHTTPListeners = []model.HTTPListener{
 		Name: "http",
 		Sources: []model.FullyQualifiedResource{
 			{
-				Kind:      "Gateway",
 				Name:      "same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Group:     "gateway.networking.k8s.io",
+				Version:   "v1",
+				Kind:      "Gateway",
 			},
 		},
 		Port:     80,
@@ -675,9 +707,11 @@ var backendProtocolEnabledH2CHTTPListeners = []model.HTTPListener{
 		Name: "http",
 		Sources: []model.FullyQualifiedResource{
 			{
-				Kind:      "Gateway",
 				Name:      "same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Group:     "gateway.networking.k8s.io",
+				Version:   "v1",
+				Kind:      "Gateway",
 			},
 		},
 		Port:     80,
@@ -704,7 +738,8 @@ var backendProtocolEnabledH2CHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEn
 		Name:      "cilium-gateway-same-namespace",
 		Namespace: "gateway-conformance-infra",
 		Labels: map[string]string{
-			"cilium.io/use-original-source-address": "false",
+			"cilium.io/use-original-source-address":  "false",
+			"gateway.networking.k8s.io/gateway-name": "same-namespace",
 		},
 		OwnerReferences: []metav1.OwnerReference{
 			{
@@ -720,6 +755,9 @@ var backendProtocolEnabledH2CHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEn
 			{
 				Name:      "cilium-gateway-same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Ports: []uint16{
+					80,
+				},
 			},
 		},
 		BackendServices: []*ciliumv2.Service{
@@ -765,6 +803,8 @@ var crossNamespaceHTTPListeners = []model.HTTPListener{
 			{
 				Name:      "backend-namespaces",
 				Namespace: "gateway-conformance-infra",
+				Group:     "gateway.networking.k8s.io",
+				Version:   "v1",
 				Kind:      "Gateway",
 			},
 		},
@@ -791,7 +831,8 @@ var crossNamespaceHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 		Name:      "cilium-gateway-backend-namespaces",
 		Namespace: "gateway-conformance-infra",
 		Labels: map[string]string{
-			"cilium.io/use-original-source-address": "false",
+			"cilium.io/use-original-source-address":  "false",
+			"gateway.networking.k8s.io/gateway-name": "backend-namespaces",
 		},
 		OwnerReferences: []metav1.OwnerReference{
 			{
@@ -807,6 +848,9 @@ var crossNamespaceHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 			{
 				Name:      "cilium-gateway-backend-namespaces",
 				Namespace: "gateway-conformance-infra",
+				Ports: []uint16{
+					80,
+				},
 			},
 		},
 		BackendServices: []*ciliumv2.Service{
@@ -851,8 +895,10 @@ var exactPathMatchingHTTPListeners = []model.HTTPListener{
 		Sources: []model.FullyQualifiedResource{
 			{
 				Name:      "same-namespace",
-				Kind:      "Gateway",
 				Namespace: "gateway-conformance-infra",
+				Group:     "gateway.networking.k8s.io",
+				Version:   "v1",
+				Kind:      "Gateway",
 			},
 		},
 		Port:     80,
@@ -891,7 +937,8 @@ var exactPathMatchingHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfi
 		Name:      "cilium-gateway-same-namespace",
 		Namespace: "gateway-conformance-infra",
 		Labels: map[string]string{
-			"cilium.io/use-original-source-address": "false",
+			"cilium.io/use-original-source-address":  "false",
+			"gateway.networking.k8s.io/gateway-name": "same-namespace",
 		},
 		OwnerReferences: []metav1.OwnerReference{
 			{
@@ -907,6 +954,9 @@ var exactPathMatchingHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfi
 			{
 				Name:      "cilium-gateway-same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Ports: []uint16{
+					80,
+				},
 			},
 		},
 		BackendServices: []*ciliumv2.Service{
@@ -966,6 +1016,9 @@ var headerMatchingHTTPListeners = []model.HTTPListener{
 			{
 				Name:      "same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Group:     "gateway.networking.k8s.io",
+				Version:   "v1",
+				Kind:      "Gateway",
 			},
 		},
 		Port:     80,
@@ -1103,12 +1156,14 @@ var headerMatchingHTTPCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 		Name:      "cilium-gateway-same-namespace",
 		Namespace: "gateway-conformance-infra",
 		Labels: map[string]string{
-			"cilium.io/use-original-source-address": "false",
+			"cilium.io/use-original-source-address":  "false",
+			"gateway.networking.k8s.io/gateway-name": "same-namespace",
 		},
 		OwnerReferences: []metav1.OwnerReference{
 			{
 				APIVersion: "gateway.networking.k8s.io/v1",
 				Name:       "same-namespace",
+				Kind:       "Gateway",
 				Controller: model.AddressOf(true),
 			},
 		},
@@ -1118,6 +1173,9 @@ var headerMatchingHTTPCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 			{
 				Name:      "cilium-gateway-same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Ports: []uint16{
+					80,
+				},
 			},
 		},
 		BackendServices: []*ciliumv2.Service{
@@ -1309,9 +1367,11 @@ var hostnameIntersectionHTTPListeners = []model.HTTPListener{
 		Name: "listener-1",
 		Sources: []model.FullyQualifiedResource{
 			{
-				Kind:      "Gateway",
 				Name:      "httproute-hostname-intersection",
 				Namespace: "gateway-conformance-infra",
+				Group:     "gateway.networking.k8s.io",
+				Version:   "v1",
+				Kind:      "Gateway",
 			},
 		},
 		Port:     80,
@@ -1349,9 +1409,11 @@ var hostnameIntersectionHTTPListeners = []model.HTTPListener{
 		Name: "listener-2",
 		Sources: []model.FullyQualifiedResource{
 			{
-				Kind:      "Gateway",
 				Namespace: "gateway-conformance-infra",
 				Name:      "httproute-hostname-intersection",
+				Group:     "gateway.networking.k8s.io",
+				Version:   "v1",
+				Kind:      "Gateway",
 			},
 		},
 		Port:     80,
@@ -1376,9 +1438,11 @@ var hostnameIntersectionHTTPListeners = []model.HTTPListener{
 		Name: "listener-3",
 		Sources: []model.FullyQualifiedResource{
 			{
-				Kind:      "Gateway",
 				Name:      "httproute-hostname-intersection",
 				Namespace: "gateway-conformance-infra",
+				Group:     "gateway.networking.k8s.io",
+				Version:   "v1",
+				Kind:      "Gateway",
 			},
 		},
 		Port:     80,
@@ -1406,7 +1470,8 @@ var hostnameIntersectionHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyCo
 		Name:      "cilium-gateway-httproute-hostname-intersection",
 		Namespace: "gateway-conformance-infra",
 		Labels: map[string]string{
-			"cilium.io/use-original-source-address": "false",
+			"cilium.io/use-original-source-address":  "false",
+			"gateway.networking.k8s.io/gateway-name": "httproute-hostname-intersection",
 		},
 		OwnerReferences: []metav1.OwnerReference{
 			{
@@ -1422,6 +1487,9 @@ var hostnameIntersectionHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyCo
 			{
 				Name:      "cilium-gateway-httproute-hostname-intersection",
 				Namespace: "gateway-conformance-infra",
+				Ports: []uint16{
+					80,
+				},
 			},
 		},
 		BackendServices: []*ciliumv2.Service{
@@ -1543,6 +1611,9 @@ var listenerHostnameMatchingHTTPListeners = []model.HTTPListener{
 			{
 				Name:      "httproute-listener-hostname-matching",
 				Namespace: "gateway-conformance-infra",
+				Group:     "gateway.networking.k8s.io",
+				Version:   "v1",
+				Kind:      "Gateway",
 			},
 		},
 		Port:     80,
@@ -1568,6 +1639,9 @@ var listenerHostnameMatchingHTTPListeners = []model.HTTPListener{
 			{
 				Name:      "httproute-listener-hostname-matching",
 				Namespace: "gateway-conformance-infra",
+				Group:     "gateway.networking.k8s.io",
+				Version:   "v1",
+				Kind:      "Gateway",
 			},
 		},
 		Port:     80,
@@ -1593,6 +1667,9 @@ var listenerHostnameMatchingHTTPListeners = []model.HTTPListener{
 			{
 				Name:      "httproute-listener-hostname-matching",
 				Namespace: "gateway-conformance-infra",
+				Group:     "gateway.networking.k8s.io",
+				Version:   "v1",
+				Kind:      "Gateway",
 			},
 		},
 		Port:     80,
@@ -1618,6 +1695,9 @@ var listenerHostnameMatchingHTTPListeners = []model.HTTPListener{
 			{
 				Name:      "httproute-listener-hostname-matching",
 				Namespace: "gateway-conformance-infra",
+				Group:     "gateway.networking.k8s.io",
+				Version:   "v1",
+				Kind:      "Gateway",
 			},
 		},
 		Port:     80,
@@ -1645,11 +1725,13 @@ var listenerHostNameMatchingCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 		Name:      "cilium-gateway-httproute-listener-hostname-matching",
 		Namespace: "gateway-conformance-infra",
 		Labels: map[string]string{
-			"cilium.io/use-original-source-address": "false",
+			"cilium.io/use-original-source-address":  "false",
+			"gateway.networking.k8s.io/gateway-name": "httproute-listener-hostname-matching",
 		},
 		OwnerReferences: []metav1.OwnerReference{
 			{
 				APIVersion: "gateway.networking.k8s.io/v1",
+				Kind:       "Gateway",
 				Name:       "httproute-listener-hostname-matching",
 				Controller: model.AddressOf(true),
 			},
@@ -1660,6 +1742,9 @@ var listenerHostNameMatchingCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 			{
 				Name:      "cilium-gateway-httproute-listener-hostname-matching",
 				Namespace: "gateway-conformance-infra",
+				Ports: []uint16{
+					80,
+				},
 			},
 		},
 		BackendServices: []*ciliumv2.Service{
@@ -1757,9 +1842,11 @@ var matchingAcrossHTTPListeners = []model.HTTPListener{
 		Name: "http",
 		Sources: []model.FullyQualifiedResource{
 			{
-				Kind:      "Gateway",
 				Name:      "same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Group:     "gateway.networking.k8s.io",
+				Version:   "v1",
+				Kind:      "Gateway",
 			},
 		},
 		Port:     80,
@@ -1807,7 +1894,8 @@ var matchingAcrossHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 		Name:      "cilium-gateway-same-namespace",
 		Namespace: "gateway-conformance-infra",
 		Labels: map[string]string{
-			"cilium.io/use-original-source-address": "false",
+			"cilium.io/use-original-source-address":  "false",
+			"gateway.networking.k8s.io/gateway-name": "same-namespace",
 		},
 		OwnerReferences: []metav1.OwnerReference{
 			{
@@ -1823,6 +1911,9 @@ var matchingAcrossHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 			{
 				Name:      "cilium-gateway-same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Ports: []uint16{
+					80,
+				},
 			},
 		},
 		BackendServices: []*ciliumv2.Service{
@@ -1931,9 +2022,11 @@ var matchingHTTPListeners = []model.HTTPListener{
 		Name: "http",
 		Sources: []model.FullyQualifiedResource{
 			{
-				Kind:      "Gateway",
 				Name:      "same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Group:     "gateway.networking.k8s.io",
+				Version:   "v1",
+				Kind:      "Gateway",
 			},
 		},
 		Port: 80, Hostname: "*",
@@ -1983,7 +2076,8 @@ var matchingHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 		Name:      "cilium-gateway-same-namespace",
 		Namespace: "gateway-conformance-infra",
 		Labels: map[string]string{
-			"cilium.io/use-original-source-address": "false",
+			"cilium.io/use-original-source-address":  "false",
+			"gateway.networking.k8s.io/gateway-name": "same-namespace",
 		},
 		OwnerReferences: []metav1.OwnerReference{
 			{
@@ -1999,6 +2093,9 @@ var matchingHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 			{
 				Name:      "cilium-gateway-same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Ports: []uint16{
+					80,
+				},
 			},
 		},
 		BackendServices: []*ciliumv2.Service{
@@ -2080,9 +2177,11 @@ var queryParamMatchingHTTPListeners = []model.HTTPListener{
 		Name: "http",
 		Sources: []model.FullyQualifiedResource{
 			{
-				Kind:      "Gateway",
 				Name:      "same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Group:     "gateway.networking.k8s.io",
+				Version:   "v1",
+				Kind:      "Gateway",
 			},
 		},
 		Port:     80,
@@ -2169,7 +2268,8 @@ var queryParamMatchingHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConf
 		Name:      "cilium-gateway-same-namespace",
 		Namespace: "gateway-conformance-infra",
 		Labels: map[string]string{
-			"cilium.io/use-original-source-address": "false",
+			"cilium.io/use-original-source-address":  "false",
+			"gateway.networking.k8s.io/gateway-name": "same-namespace",
 		},
 		OwnerReferences: []metav1.OwnerReference{
 			{
@@ -2185,6 +2285,9 @@ var queryParamMatchingHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConf
 			{
 				Name:      "cilium-gateway-same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Ports: []uint16{
+					80,
+				},
 			},
 		},
 		BackendServices: []*ciliumv2.Service{
@@ -2322,9 +2425,11 @@ var methodMatchingHTTPListeners = []model.HTTPListener{
 		Name: "http",
 		Sources: []model.FullyQualifiedResource{
 			{
-				Kind:      "Gateway",
 				Name:      "same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Group:     "gateway.networking.k8s.io",
+				Version:   "v1",
+				Kind:      "Gateway",
 			},
 		},
 		Port:     80,
@@ -2363,7 +2468,8 @@ var methodMatchingHTTPListenersHTTPListenersCiliumEnvoyConfig = &ciliumv2.Cilium
 		Name:      "cilium-gateway-same-namespace",
 		Namespace: "gateway-conformance-infra",
 		Labels: map[string]string{
-			"cilium.io/use-original-source-address": "false",
+			"cilium.io/use-original-source-address":  "false",
+			"gateway.networking.k8s.io/gateway-name": "same-namespace",
 		},
 		OwnerReferences: []metav1.OwnerReference{
 			{
@@ -2379,6 +2485,9 @@ var methodMatchingHTTPListenersHTTPListenersCiliumEnvoyConfig = &ciliumv2.Cilium
 			{
 				Name:      "cilium-gateway-same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Ports: []uint16{
+					80,
+				},
 			},
 		},
 		BackendServices: []*ciliumv2.Service{
@@ -2414,14 +2523,14 @@ var methodMatchingHTTPListenersHTTPListenersCiliumEnvoyConfig = &ciliumv2.Cilium
 												HeaderMatchSpecifier: &envoy_config_route_v3.HeaderMatcher_StringMatch{
 													StringMatch: &envoy_type_matcher_v3.StringMatcher{
 														MatchPattern: &envoy_type_matcher_v3.StringMatcher_Exact{
-															Exact: "POST",
+															Exact: "GET",
 														},
 													},
 												},
 											},
 										},
 									},
-									Action: routeActionBackendV1,
+									Action: routeActionBackendV2,
 								},
 								{
 									Match: &envoy_config_route_v3.RouteMatch{
@@ -2434,14 +2543,14 @@ var methodMatchingHTTPListenersHTTPListenersCiliumEnvoyConfig = &ciliumv2.Cilium
 												HeaderMatchSpecifier: &envoy_config_route_v3.HeaderMatcher_StringMatch{
 													StringMatch: &envoy_type_matcher_v3.StringMatcher{
 														MatchPattern: &envoy_type_matcher_v3.StringMatcher_Exact{
-															Exact: "GET",
+															Exact: "POST",
 														},
 													},
 												},
 											},
 										},
 									},
-									Action: routeActionBackendV2,
+									Action: routeActionBackendV1,
 								},
 							},
 						},
@@ -2460,9 +2569,11 @@ var requestHeaderModifierHTTPListeners = []model.HTTPListener{
 		Name: "http",
 		Sources: []model.FullyQualifiedResource{
 			{
-				Kind:      "Gateway",
 				Name:      "same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Group:     "gateway.networking.k8s.io",
+				Version:   "v1",
+				Kind:      "Gateway",
 			},
 		},
 		Port: 80, Hostname: "*",
@@ -2602,7 +2713,8 @@ var requestHeaderModifierHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyC
 		Name:      "cilium-gateway-same-namespace",
 		Namespace: "gateway-conformance-infra",
 		Labels: map[string]string{
-			"cilium.io/use-original-source-address": "false",
+			"cilium.io/use-original-source-address":  "false",
+			"gateway.networking.k8s.io/gateway-name": "same-namespace",
 		},
 		OwnerReferences: []metav1.OwnerReference{
 			{
@@ -2618,6 +2730,9 @@ var requestHeaderModifierHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyC
 			{
 				Name:      "cilium-gateway-same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Ports: []uint16{
+					80,
+				},
 			},
 		},
 		BackendServices: []*ciliumv2.Service{
@@ -2767,9 +2882,11 @@ var backendRefsRequestHeaderModifierHTTPListeners = []model.HTTPListener{
 		Name: "http",
 		Sources: []model.FullyQualifiedResource{
 			{
-				Kind:      "Gateway",
 				Name:      "same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Group:     "gateway.networking.k8s.io",
+				Version:   "v1",
+				Kind:      "Gateway",
 			},
 		},
 		Port: 80, Hostname: "*",
@@ -2900,7 +3017,7 @@ var backendRefsRequestHeaderModifierHTTPListeners = []model.HTTPListener{
 						Port: &model.BackendPort{
 							Port: 8080,
 						},
-						Weight: pointer.Int32(50),
+						Weight: ptr.To[int32](50),
 					},
 					{
 						Name:      "infra-backend-v2",
@@ -2908,7 +3025,7 @@ var backendRefsRequestHeaderModifierHTTPListeners = []model.HTTPListener{
 						Port: &model.BackendPort{
 							Port: 8080,
 						},
-						Weight: pointer.Int32(50),
+						Weight: ptr.To[int32](50),
 					},
 				},
 				BackendHTTPFilters: []*model.BackendHTTPFilter{
@@ -2972,7 +3089,7 @@ var backendRefsRequestHeaderModifierHTTPListeners = []model.HTTPListener{
 						Port: &model.BackendPort{
 							Port: 8080,
 						},
-						Weight: pointer.Int32(50),
+						Weight: ptr.To[int32](50),
 					},
 					{
 						Name:      "infra-backend-v2",
@@ -2980,7 +3097,7 @@ var backendRefsRequestHeaderModifierHTTPListeners = []model.HTTPListener{
 						Port: &model.BackendPort{
 							Port: 8080,
 						},
-						Weight: pointer.Int32(50),
+						Weight: ptr.To[int32](50),
 					},
 				},
 				BackendHTTPFilters: []*model.BackendHTTPFilter{
@@ -3015,7 +3132,7 @@ var backendRefsRequestHeaderModifierHTTPListeners = []model.HTTPListener{
 						Port: &model.BackendPort{
 							Port: 8080,
 						},
-						Weight: pointer.Int32(10),
+						Weight: ptr.To[int32](10),
 					},
 					{
 						Name:      "infra-backend-v2",
@@ -3023,7 +3140,7 @@ var backendRefsRequestHeaderModifierHTTPListeners = []model.HTTPListener{
 						Port: &model.BackendPort{
 							Port: 8080,
 						},
-						Weight: pointer.Int32(20),
+						Weight: ptr.To[int32](20),
 					},
 					{
 						Name:      "infra-backend-v3",
@@ -3031,7 +3148,7 @@ var backendRefsRequestHeaderModifierHTTPListeners = []model.HTTPListener{
 						Port: &model.BackendPort{
 							Port: 8080,
 						},
-						Weight: pointer.Int32(70),
+						Weight: ptr.To[int32](70),
 					},
 				},
 				BackendHTTPFilters: []*model.BackendHTTPFilter{
@@ -3086,7 +3203,8 @@ var backendRefsRequestHeaderModifierHTTPListenersCiliumEnvoyConfig = &ciliumv2.C
 		Name:      "cilium-gateway-same-namespace",
 		Namespace: "gateway-conformance-infra",
 		Labels: map[string]string{
-			"cilium.io/use-original-source-address": "false",
+			"cilium.io/use-original-source-address":  "false",
+			"gateway.networking.k8s.io/gateway-name": "same-namespace",
 		},
 		OwnerReferences: []metav1.OwnerReference{
 			{
@@ -3102,6 +3220,9 @@ var backendRefsRequestHeaderModifierHTTPListenersCiliumEnvoyConfig = &ciliumv2.C
 			{
 				Name:      "cilium-gateway-same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Ports: []uint16{
+					80,
+				},
 			},
 		},
 		BackendServices: []*ciliumv2.Service{
@@ -3423,9 +3544,11 @@ var backendRefsResponseHeaderModifierHTTPListeners = []model.HTTPListener{
 		Name: "http",
 		Sources: []model.FullyQualifiedResource{
 			{
-				Kind:      "Gateway",
 				Name:      "same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Group:     "gateway.networking.k8s.io",
+				Version:   "v1",
+				Kind:      "Gateway",
 			},
 		},
 		Port: 80, Hostname: "*",
@@ -3556,7 +3679,7 @@ var backendRefsResponseHeaderModifierHTTPListeners = []model.HTTPListener{
 						Port: &model.BackendPort{
 							Port: 8080,
 						},
-						Weight: pointer.Int32(50),
+						Weight: ptr.To[int32](50),
 					},
 					{
 						Name:      "infra-backend-v2",
@@ -3564,7 +3687,7 @@ var backendRefsResponseHeaderModifierHTTPListeners = []model.HTTPListener{
 						Port: &model.BackendPort{
 							Port: 8080,
 						},
-						Weight: pointer.Int32(50),
+						Weight: ptr.To[int32](50),
 					},
 				},
 				BackendHTTPFilters: []*model.BackendHTTPFilter{
@@ -3628,7 +3751,7 @@ var backendRefsResponseHeaderModifierHTTPListeners = []model.HTTPListener{
 						Port: &model.BackendPort{
 							Port: 8080,
 						},
-						Weight: pointer.Int32(50),
+						Weight: ptr.To[int32](50),
 					},
 					{
 						Name:      "infra-backend-v2",
@@ -3636,7 +3759,7 @@ var backendRefsResponseHeaderModifierHTTPListeners = []model.HTTPListener{
 						Port: &model.BackendPort{
 							Port: 8080,
 						},
-						Weight: pointer.Int32(50),
+						Weight: ptr.To[int32](50),
 					},
 				},
 				BackendHTTPFilters: []*model.BackendHTTPFilter{
@@ -3671,7 +3794,7 @@ var backendRefsResponseHeaderModifierHTTPListeners = []model.HTTPListener{
 						Port: &model.BackendPort{
 							Port: 8080,
 						},
-						Weight: pointer.Int32(10),
+						Weight: ptr.To[int32](10),
 					},
 					{
 						Name:      "infra-backend-v2",
@@ -3679,7 +3802,7 @@ var backendRefsResponseHeaderModifierHTTPListeners = []model.HTTPListener{
 						Port: &model.BackendPort{
 							Port: 8080,
 						},
-						Weight: pointer.Int32(20),
+						Weight: ptr.To[int32](20),
 					},
 					{
 						Name:      "infra-backend-v3",
@@ -3687,7 +3810,7 @@ var backendRefsResponseHeaderModifierHTTPListeners = []model.HTTPListener{
 						Port: &model.BackendPort{
 							Port: 8080,
 						},
-						Weight: pointer.Int32(70),
+						Weight: ptr.To[int32](70),
 					},
 				},
 				BackendHTTPFilters: []*model.BackendHTTPFilter{
@@ -3742,7 +3865,8 @@ var backendRefsResponseHeaderModifierHTTPListenersCiliumEnvoyConfig = &ciliumv2.
 		Name:      "cilium-gateway-same-namespace",
 		Namespace: "gateway-conformance-infra",
 		Labels: map[string]string{
-			"cilium.io/use-original-source-address": "false",
+			"cilium.io/use-original-source-address":  "false",
+			"gateway.networking.k8s.io/gateway-name": "same-namespace",
 		},
 		OwnerReferences: []metav1.OwnerReference{
 			{
@@ -3758,6 +3882,9 @@ var backendRefsResponseHeaderModifierHTTPListenersCiliumEnvoyConfig = &ciliumv2.
 			{
 				Name:      "cilium-gateway-same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Ports: []uint16{
+					80,
+				},
 			},
 		},
 		BackendServices: []*ciliumv2.Service{
@@ -4079,9 +4206,11 @@ var requestRedirectHTTPListeners = []model.HTTPListener{
 		Name: "http",
 		Sources: []model.FullyQualifiedResource{
 			{
-				Kind:      "Gateway",
 				Name:      "same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Group:     "gateway.networking.k8s.io",
+				Version:   "v1",
+				Kind:      "Gateway",
 			},
 		},
 		Port:     80,
@@ -4137,7 +4266,8 @@ var requestRedirectHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 		Name:      "cilium-gateway-same-namespace",
 		Namespace: "gateway-conformance-infra",
 		Labels: map[string]string{
-			"cilium.io/use-original-source-address": "false",
+			"cilium.io/use-original-source-address":  "false",
+			"gateway.networking.k8s.io/gateway-name": "same-namespace",
 		},
 		OwnerReferences: []metav1.OwnerReference{
 			{
@@ -4153,6 +4283,9 @@ var requestRedirectHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 			{
 				Name:      "cilium-gateway-same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Ports: []uint16{
+					80,
+				},
 			},
 		},
 		BackendServices: []*ciliumv2.Service{
@@ -4226,9 +4359,11 @@ var requestRedirectWithMultiHTTPListeners = []model.HTTPListener{
 		Name: "http",
 		Sources: []model.FullyQualifiedResource{
 			{
-				Kind:      "Gateway",
 				Name:      "same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Group:     "gateway.networking.k8s.io",
+				Version:   "v1",
+				Kind:      "Gateway",
 			},
 		},
 		Port:     80,
@@ -4264,9 +4399,11 @@ var requestRedirectWithMultiHTTPListeners = []model.HTTPListener{
 		Name: "https",
 		Sources: []model.FullyQualifiedResource{
 			{
-				Kind:      "Gateway",
 				Name:      "same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Group:     "gateway.networking.k8s.io",
+				Version:   "v1",
+				Kind:      "Gateway",
 			},
 		},
 		Port:     443,
@@ -4311,7 +4448,8 @@ var requestRedirectWithMultiHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnv
 		Name:      "cilium-gateway-same-namespace",
 		Namespace: "gateway-conformance-infra",
 		Labels: map[string]string{
-			"cilium.io/use-original-source-address": "false",
+			"cilium.io/use-original-source-address":  "false",
+			"gateway.networking.k8s.io/gateway-name": "same-namespace",
 		},
 		OwnerReferences: []metav1.OwnerReference{
 			{
@@ -4327,6 +4465,10 @@ var requestRedirectWithMultiHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnv
 			{
 				Name:      "cilium-gateway-same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Ports: []uint16{
+					80,
+					443,
+				},
 			},
 		},
 		BackendServices: []*ciliumv2.Service{
@@ -4421,9 +4563,11 @@ var responseHeaderModifierHTTPListeners = []model.HTTPListener{
 		Name: "http",
 		Sources: []model.FullyQualifiedResource{
 			{
-				Kind:      "Gateway",
 				Name:      "same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Group:     "gateway.networking.k8s.io",
+				Version:   "v1",
+				Kind:      "Gateway",
 			},
 		},
 		Port: 80, Hostname: "*",
@@ -4579,7 +4723,8 @@ var responseHeaderModifierHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoy
 		Name:      "cilium-gateway-same-namespace",
 		Namespace: "gateway-conformance-infra",
 		Labels: map[string]string{
-			"cilium.io/use-original-source-address": "false",
+			"cilium.io/use-original-source-address":  "false",
+			"gateway.networking.k8s.io/gateway-name": "same-namespace",
 		},
 		OwnerReferences: []metav1.OwnerReference{
 			{
@@ -4595,6 +4740,9 @@ var responseHeaderModifierHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoy
 			{
 				Name:      "cilium-gateway-same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Ports: []uint16{
+					80,
+				},
 			},
 		},
 		BackendServices: []*ciliumv2.Service{
@@ -4774,6 +4922,8 @@ var rewriteHostHTTPListeners = []model.HTTPListener{
 			{
 				Name:      "same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Group:     "gateway.networking.k8s.io",
+				Version:   "v1",
 				Kind:      "Gateway",
 			},
 		},
@@ -4820,7 +4970,8 @@ var rewriteHostHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 		Name:      "cilium-gateway-same-namespace",
 		Namespace: "gateway-conformance-infra",
 		Labels: map[string]string{
-			"cilium.io/use-original-source-address": "false",
+			"cilium.io/use-original-source-address":  "false",
+			"gateway.networking.k8s.io/gateway-name": "same-namespace",
 		},
 		OwnerReferences: []metav1.OwnerReference{
 			{
@@ -4836,6 +4987,9 @@ var rewriteHostHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 			{
 				Name:      "cilium-gateway-same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Ports: []uint16{
+					80,
+				},
 			},
 		},
 		BackendServices: []*ciliumv2.Service{
@@ -4918,8 +5072,10 @@ var rewritePathHTTPListeners = []model.HTTPListener{
 		Sources: []model.FullyQualifiedResource{
 			{
 				Name:      "same-namespace",
-				Kind:      "Gateway",
 				Namespace: "gateway-conformance-infra",
+				Group:     "gateway.networking.k8s.io",
+				Version:   "v1",
+				Kind:      "Gateway",
 			},
 		},
 		Port:     80,
@@ -5040,7 +5196,8 @@ var rewritePathHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 		Name:      "cilium-gateway-same-namespace",
 		Namespace: "gateway-conformance-infra",
 		Labels: map[string]string{
-			"cilium.io/use-original-source-address": "false",
+			"cilium.io/use-original-source-address":  "false",
+			"gateway.networking.k8s.io/gateway-name": "same-namespace",
 		},
 		OwnerReferences: []metav1.OwnerReference{
 			{
@@ -5056,6 +5213,9 @@ var rewritePathHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 			{
 				Name:      "cilium-gateway-same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Ports: []uint16{
+					80,
+				},
 			},
 		},
 		BackendServices: []*ciliumv2.Service{
@@ -5222,8 +5382,10 @@ var mirrorHTTPListeners = []model.HTTPListener{
 		Sources: []model.FullyQualifiedResource{
 			{
 				Name:      "same-namespace",
-				Kind:      "Gateway",
 				Namespace: "gateway-conformance-infra",
+				Group:     "gateway.networking.k8s.io",
+				Version:   "v1",
+				Kind:      "Gateway",
 			},
 		},
 		Port:     80,
@@ -5261,7 +5423,8 @@ var mirrorHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 		Name:      "cilium-gateway-same-namespace",
 		Namespace: "gateway-conformance-infra",
 		Labels: map[string]string{
-			"cilium.io/use-original-source-address": "false",
+			"cilium.io/use-original-source-address":  "false",
+			"gateway.networking.k8s.io/gateway-name": "same-namespace",
 		},
 		OwnerReferences: []metav1.OwnerReference{
 			{
@@ -5277,6 +5440,9 @@ var mirrorHTTPListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 			{
 				Name:      "cilium-gateway-same-namespace",
 				Namespace: "gateway-conformance-infra",
+				Ports: []uint16{
+					80,
+				},
 			},
 		},
 		BackendServices: []*ciliumv2.Service{
@@ -5490,6 +5656,16 @@ func toListenerFilter(routeName string) *envoy_config_listener.Filter {
 				},
 				UseRemoteAddress: &wrapperspb.BoolValue{Value: true},
 				SkipXffAppend:    false,
+				InternalAddressConfig: &http_connection_manager_v3.HttpConnectionManager_InternalAddressConfig{
+					UnixSockets: false,
+					CidrRanges: []*envoy_config_core_v3.CidrRange{
+						{AddressPrefix: "10.0.0.0", PrefixLen: &wrapperspb.UInt32Value{Value: 8}},
+						{AddressPrefix: "172.16.0.0", PrefixLen: &wrapperspb.UInt32Value{Value: 12}},
+						{AddressPrefix: "192.168.0.0", PrefixLen: &wrapperspb.UInt32Value{Value: 16}},
+						{AddressPrefix: "127.0.0.1", PrefixLen: &wrapperspb.UInt32Value{Value: 32}},
+						{AddressPrefix: "::1", PrefixLen: &wrapperspb.UInt32Value{Value: 128}},
+					},
+				},
 				HttpFilters: []*http_connection_manager_v3.HttpFilter{
 					{
 						Name: "envoy.filters.http.grpc_web",

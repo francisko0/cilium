@@ -56,8 +56,9 @@ const (
 	// TemplatesDir is the default path for the compiled template objects relative to StateDir
 	TemplatesDir = "templates"
 
-	// TemplatePath is the default path for a symlink to a template relative to StateDir/<EPID>
-	TemplatePath = "template.o"
+	// TemplateIDPath is the name of a file which contains the ID (aka hash) of
+	// the template used by the endpoint.
+	TemplateIDPath = "template.txt"
 
 	// BpfDir is the default path for template files relative to LibDir
 	BpfDir = "bpf"
@@ -180,13 +181,29 @@ const (
 	// DNSProxyEnableTransparentMode enables transparent mode for the DNS proxy.
 	DNSProxyEnableTransparentMode = false
 
+	// DNSProxyLockCount is the default array size containing mutexes which protect
+	// against parallel handling of DNS response names.
+	DNSProxyLockCount = 131
+
+	// DNSProxyLockTimeout is the default timeout when acquiring the locks controlled by
+	// DNSProxyLockCount.
+	DNSProxyLockTimeout = 500 * time.Millisecond
+
+	// DNSProxySocketLingerTimeout defines how many seconds we wait for the connection
+	// between the DNS proxy and the upstream server to be closed.
+	DNSProxySocketLingerTimeout = 10
+
 	// IdentityChangeGracePeriod is the default value for
 	// option.IdentityChangeGracePeriod
 	IdentityChangeGracePeriod = 5 * time.Second
 
-	// IdentityRestoreGracePeriod is the default value for
-	// option.IdentityRestoreGracePeriod
-	IdentityRestoreGracePeriod = 10 * time.Minute
+	// IdentityRestoreGracePeriodKvstore is the default value for
+	// option.IdentityRestoreGracePeriod when kvstore is enabled.
+	IdentityRestoreGracePeriodKvstore = 10 * time.Minute
+
+	// IdentityRestoreGracePeriodKvstore is the default value for
+	// option.IdentityRestoreGracePeriod when only k8s is in use
+	IdentityRestoreGracePeriodK8s = 30 * time.Second
 
 	// ExecTimeout is a timeout for executing commands.
 	ExecTimeout = 300 * time.Second
@@ -244,6 +261,10 @@ const (
 	// be necessary on key rotations.
 	EnableIPsecKeyWatcher = true
 
+	// Enable caching for XfrmState for IPSec. Significantly reduces CPU usage
+	// in large clusters.
+	EnableIPSecXfrmStateCaching = true
+
 	// Enable IPSec encrypted overlay
 	//
 	// This feature will encrypt overlay traffic before it leaves the cluster.
@@ -287,6 +308,9 @@ const (
 
 	// EnableAutoDirectRouting is the default value for EnableAutoDirectRouting
 	EnableAutoDirectRouting = false
+
+	// EnableDirectRoutingSkipUnreachable is the default value for EnableDirectRoutingIgnoreUnreachableName
+	EnableDirectRoutingSkipUnreachable = false
 
 	// EnableHealthChecking is the default value for EnableHealthChecking
 	EnableHealthChecking = true
@@ -574,6 +598,9 @@ const (
 
 	// EnableEnvoyConfig is the default value for option.EnableEnvoyConfig
 	EnableEnvoyConfig = false
+
+	// NetNsPath is the default path to the mounted network namespaces directory
+	NetNsPath = "/var/run/cilium/netns"
 )
 
 var (

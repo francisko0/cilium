@@ -462,6 +462,51 @@ var HaveTCX = sync.OnceValue(func() error {
 	})
 })
 
+// HaveNetkit returns nil if the running kernel supports attaching bpf programs
+// to netkit devices.
+var HaveNetkit = sync.OnceValue(func() error {
+	prog, err := ebpf.NewProgram(&ebpf.ProgramSpec{
+		Type: ebpf.SchedCLS,
+		Instructions: asm.Instructions{
+			asm.Mov.Imm(asm.R0, 0),
+			asm.Return(),
+		},
+		License: "Apache-2.0",
+	})
+	if err != nil {
+		return err
+	}
+	defer prog.Close()
+
+	ns, err := netns.New()
+	if err != nil {
+		return fmt.Errorf("create netns: %w", err)
+	}
+	defer ns.Close()
+
+	return ns.Do(func() error {
+		l, err := link.AttachNetkit(link.NetkitOptions{
+			Program:   prog,
+			Attach:    ebpf.AttachNetkitPrimary,
+			Interface: int(^uint32(0)),
+		})
+		// We rely on this being checked during the syscall. With
+		// an otherwise correct payload we expect ENODEV here as
+		// an indication that the feature is present.
+		if errors.Is(err, unix.ENODEV) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("creating link: %w", err)
+		}
+		if err := l.Close(); err != nil {
+			return fmt.Errorf("closing link: %w", err)
+		}
+
+		return fmt.Errorf("unexpected success: %w", err)
+	})
+})
+
 // HaveOuterSourceIPSupport tests whether the kernel support setting the outer
 // source IP address via the bpf_skb_set_tunnel_key BPF helper. We can't rely
 // on the verifier to reject a program using the new support because the
@@ -774,5 +819,29 @@ func writeFeatureHeader(writer io.Writer, features map[string]bool, common bool)
 		return fmt.Errorf("could not write template: %w", err)
 	}
 
+	return nil
+}
+
+// HaveBatchAPI checks if kernel supports batched bpf map lookup API.
+func HaveBatchAPI() error {
+	spec := ebpf.MapSpec{
+		Type:       ebpf.LRUHash,
+		KeySize:    1,
+		ValueSize:  1,
+		MaxEntries: 2,
+	}
+	m, err := ebpf.NewMapWithOptions(&spec, ebpf.MapOptions{})
+	if err != nil {
+		return ErrNotSupported
+	}
+	defer m.Close()
+	var cursor ebpf.MapBatchCursor
+	_, err = m.BatchLookup(&cursor, []byte{0}, []byte{0}, nil) // only do one batched lookup
+	if err != nil {
+		if errors.Is(err, ebpf.ErrNotSupported) {
+			return ErrNotSupported
+		}
+		return nil
+	}
 	return nil
 }

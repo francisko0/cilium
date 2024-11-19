@@ -24,12 +24,12 @@ import (
 	"github.com/cilium/cilium/pkg/aws/metadata"
 	azureTypes "github.com/cilium/cilium/pkg/azure/types"
 	"github.com/cilium/cilium/pkg/controller"
-	datapath "github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/identity"
 	ipamOption "github.com/cilium/cilium/pkg/ipam/option"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/k8s/client"
+	"github.com/cilium/cilium/pkg/k8s/watchers"
 	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/node"
@@ -42,11 +42,9 @@ import (
 )
 
 const (
-	// AutoCIDR indicates that a CIDR should be allocated
-	AutoCIDR = "auto"
-
 	nodeDiscoverySubsys = "nodediscovery"
 	maxRetryCount       = 10
+	backoffDuration     = 500 * time.Millisecond
 )
 
 var (
@@ -66,7 +64,6 @@ type GetNodeAddresses interface {
 // NodeDiscovery represents a node discovery action
 type NodeDiscovery struct {
 	Manager               nodemanager.NodeManager
-	LocalConfig           datapath.LocalNodeConfiguration
 	Registrar             nodestore.NodeRegistrar
 	Registered            chan struct{}
 	localStateInitialized chan struct{}
@@ -82,18 +79,18 @@ func NewNodeDiscovery(
 	manager nodemanager.NodeManager,
 	clientset client.Clientset,
 	lns *node.LocalNodeStore,
-	localConfig datapath.LocalNodeConfiguration,
 	cniConfigManager cni.CNIConfigManager,
+	k8sNodeWatcher *watchers.K8sCiliumNodeWatcher,
 ) *NodeDiscovery {
 	return &NodeDiscovery{
 		Manager:               manager,
-		LocalConfig:           localConfig,
 		localNodeStore:        lns,
 		Registered:            make(chan struct{}),
 		localStateInitialized: make(chan struct{}),
 		cniConfigManager:      cniConfigManager,
 		clientset:             clientset,
 		ctrlmgr:               controller.NewManager(),
+		k8sGetters:            k8sNodeWatcher,
 	}
 }
 
@@ -213,6 +210,17 @@ func (n *NodeDiscovery) WaitForLocalNodeInit() {
 	<-n.localStateInitialized
 }
 
+// WaitForKVStoreSync blocks until kvstore synchronization of node information
+// completed. It returns immediately in CRD mode.
+func (n *NodeDiscovery) WaitForKVStoreSync(ctx context.Context) error {
+	select {
+	case <-n.Registered:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (n *NodeDiscovery) updateLocalNode(ln *node.LocalNode) {
 	if option.Config.KVStore != "" && !option.Config.JoinCluster {
 		n.ctrlmgr.UpdateController(
@@ -301,6 +309,8 @@ func (n *NodeDiscovery) updateCiliumNodeResource(ln *node.LocalNode) {
 			if _, err := n.clientset.CiliumV2().CiliumNodes().Update(context.TODO(), nodeResource, metav1.UpdateOptions{}); err != nil {
 				if k8serrors.IsConflict(err) {
 					log.WithError(err).Warn("Unable to update CiliumNode resource, will retry")
+					// Backoff before retrying
+					time.Sleep(backoffDuration)
 					continue
 				}
 				log.WithError(err).Fatal("Unable to update CiliumNode resource")
@@ -312,7 +322,7 @@ func (n *NodeDiscovery) updateCiliumNodeResource(ln *node.LocalNode) {
 				if k8serrors.IsConflict(err) || k8serrors.IsAlreadyExists(err) {
 					log.WithError(err).Warn("Unable to create CiliumNode resource, will retry")
 					// Backoff before retrying
-					time.Sleep(500 * time.Millisecond)
+					time.Sleep(backoffDuration)
 					continue
 				}
 				log.WithError(err).Fatal("Unable to create CiliumNode resource")
@@ -349,9 +359,9 @@ func (n *NodeDiscovery) mutateNodeResource(nodeResource *ciliumv2.CiliumNode, ln
 			// b) the LocalNode store contains an IP address which we can use instead
 			switch net.IPFamilyOfString(address.IP) {
 			case net.IPv4:
-				return !n.LocalConfig.EnableIPv4 || ln.GetCiliumInternalIP(false) != nil
+				return !option.Config.EnableIPv4 || ln.GetCiliumInternalIP(false) != nil
 			case net.IPv6:
-				return !n.LocalConfig.EnableIPv6 || ln.GetCiliumInternalIP(true) != nil
+				return !option.Config.EnableIPv6 || ln.GetCiliumInternalIP(true) != nil
 			}
 		}
 
@@ -579,10 +589,6 @@ func (n *NodeDiscovery) mutateNodeResource(nodeResource *ciliumv2.CiliumNode, ln
 	}
 
 	return nil
-}
-
-func (n *NodeDiscovery) RegisterK8sGetters(k8sGetters k8sGetters) {
-	n.k8sGetters = k8sGetters
 }
 
 func getInt(i int) *int {

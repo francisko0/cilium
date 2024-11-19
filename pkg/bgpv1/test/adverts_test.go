@@ -478,14 +478,26 @@ func Test_PodIPPoolAdvert(t *testing.T) {
 			_, err = fixture.policyClient.Update(testCtx, &fixture.config.policy, meta_v1.UpdateOptions{})
 			require.NoError(t, err)
 
-			// Validate the expected result.
-			receivedEvents, err := gobgpPeers[0].getRouteEvents(testCtx, len(step.expected))
-			require.NoError(t, err, step.name)
+			receivedRouteMatch := func() bool {
+				// Validate the expected result.
+				receivedEvents, err := gobgpPeers[0].getRouteEvents(testCtx, len(step.expected))
+				require.NoError(t, err, step.name)
+				if len(step.expected) == 0 && len(receivedEvents) == 0 {
+					return true
+				}
+				equal := reflect.DeepEqual(step.expected, receivedEvents)
+				if !equal {
+					t.Logf("route events not (yet) equal - expected: %v, actual: %v", step.expected, receivedEvents)
+				}
+				return equal
+			}
 
-			// Match events in any order.
-			t.Logf("expected events: %v", step.expected)
-			t.Logf("received events: %v", receivedEvents)
-			require.ElementsMatch(t, step.expected, receivedEvents, step.name)
+			deadline, _ := testCtx.Deadline()
+			outstanding := time.Until(deadline)
+			require.Greater(t, outstanding, 0*time.Second, "test context deadline exceeded")
+
+			// Retry receivedRouteMatch until the test context deadline.
+			require.Eventually(t, receivedRouteMatch, outstanding, 100*time.Millisecond)
 		})
 	}
 }
@@ -622,6 +634,34 @@ func Test_LBEgressAdvertisementWithLoadBalancerIP(t *testing.T) {
 					prefix:      "dddd::1",
 					prefixLen:   128,
 					isWithdrawn: false,
+				},
+			},
+		},
+		{
+			description:         "add service-c - VIP shared with service-b",
+			srvName:             "service-c",
+			ingressIP:           "dddd::1",
+			op:                  "add",
+			expectedRouteEvents: []routeEvent{}, // no event, shared VIP already advertised
+		},
+		{
+			description:         "withdraw service-b - shared VIP",
+			srvName:             "service-b",
+			ingressIP:           "",
+			op:                  "update",
+			expectedRouteEvents: []routeEvent{}, // no event, shared VIP still advertised for service-c
+		},
+		{
+			description: "withdraw service-c - shared VIP",
+			srvName:     "service-c",
+			ingressIP:   "",
+			op:          "update",
+			expectedRouteEvents: []routeEvent{
+				{
+					sourceASN:   ciliumASN,
+					prefix:      "dddd::1",
+					prefixLen:   128,
+					isWithdrawn: true, // withdrawal, shared VIP no longer used by any service
 				},
 			},
 		},

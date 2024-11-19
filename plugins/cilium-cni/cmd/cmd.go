@@ -30,6 +30,7 @@ import (
 	"github.com/cilium/cilium/pkg/datapath/connector"
 	"github.com/cilium/cilium/pkg/datapath/link"
 	"github.com/cilium/cilium/pkg/datapath/linux/route"
+	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
 	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
 	datapathOption "github.com/cilium/cilium/pkg/datapath/option"
 	"github.com/cilium/cilium/pkg/defaults"
@@ -277,7 +278,7 @@ func addIPConfigToLink(ip netip.Addr, routes []route.Route, rules []route.Rule, 
 }
 
 func configureIface(ipam *models.IPAMResponse, ifName string, state *CmdState) (string, error) {
-	l, err := netlink.LinkByName(ifName)
+	l, err := safenetlink.LinkByName(ifName)
 	if err != nil {
 		return "", fmt.Errorf("failed to lookup %q: %w", ifName, err)
 	}
@@ -404,8 +405,10 @@ func reserveLocalIPPorts(conf *models.DaemonConfigurationStatus, sysctl sysctl.S
 	}
 
 	// Note: This setting applies to IPv4 and IPv6
-	const param = "net.ipv4.ip_local_reserved_ports"
-	var reserved = conf.IPLocalReservedPorts
+	var (
+		param    = []string{"net", "ipv4", "ip_local_reserved_ports"}
+		reserved = conf.IPLocalReservedPorts
+	)
 
 	// Append our reserved ports to the ones which might already be reserved.
 	existing, err := sysctl.Read(param)
@@ -580,6 +583,39 @@ func (cmd *Cmd) Add(args *skel.CmdArgs) (err error) {
 			if err != nil {
 				return fmt.Errorf("unable to set up veth on container side: %w", err)
 			}
+		case datapathOption.DatapathModeNetkit, datapathOption.DatapathModeNetkitL2:
+			l2Mode := conf.DatapathMode == datapathOption.DatapathModeNetkitL2
+			cniID := ep.ContainerID + ":" + ep.ContainerInterfaceName
+			netkit, peer, tmpIfName, err := connector.SetupNetkit(cniID, int(conf.DeviceMTU),
+				int(conf.GROMaxSize), int(conf.GSOMaxSize),
+				int(conf.GROIPV4MaxSize), int(conf.GSOIPV4MaxSize), l2Mode, ep, sysctl)
+			if err != nil {
+				return fmt.Errorf("unable to set up netkit on host side: %w", err)
+			}
+			defer func() {
+				if err != nil {
+					if err2 := netlink.LinkDel(netkit); err2 != nil {
+						logger.WithError(err2).WithField(logfields.Netkit, netkit.Name).Warn("failed to clean up and delete netkit")
+					}
+				}
+			}()
+
+			iface := &cniTypesV1.Interface{
+				Name: netkit.Attrs().Name,
+			}
+			if l2Mode {
+				iface.Mac = netkit.Attrs().HardwareAddr.String()
+			}
+			res.Interfaces = append(res.Interfaces, iface)
+
+			if err := netlink.LinkSetNsFd(peer, ns.FD()); err != nil {
+				return fmt.Errorf("unable to move netkit pair %q to netns %s: %w", peer, args.Netns, err)
+			}
+
+			err = connector.SetupNetkitRemoteNs(ns, tmpIfName, epConf.IfName())
+			if err != nil {
+				return fmt.Errorf("unable to set up netkit on container side: %w", err)
+			}
 		}
 
 		var (
@@ -595,7 +631,7 @@ func (cmd *Cmd) Add(args *skel.CmdArgs) (err error) {
 			if err != nil {
 				return fmt.Errorf("unable to prepare IP addressing for %s: %w", ep.Addressing.IPV6, err)
 			}
-			// set the addresses interface index to that of the container-side veth
+			// set the addresses interface index to that of the container-side interface
 			ipConfig.Interface = cniTypesV1.Int(len(res.Interfaces))
 			res.IPs = append(res.IPs, ipConfig)
 			res.Routes = append(res.Routes, routes...)
@@ -610,7 +646,7 @@ func (cmd *Cmd) Add(args *skel.CmdArgs) (err error) {
 			if err != nil {
 				return fmt.Errorf("unable to prepare IP addressing for %s: %w", ep.Addressing.IPV4, err)
 			}
-			// set the addresses interface index to that of the container-side veth
+			// set the addresses interface index to that of the container-side interface
 			ipConfig.Interface = cniTypesV1.Int(len(res.Interfaces))
 			res.IPs = append(res.IPs, ipConfig)
 			res.Routes = append(res.Routes, routes...)
@@ -636,12 +672,12 @@ func (cmd *Cmd) Add(args *skel.CmdArgs) (err error) {
 		var macAddrStr string
 
 		if err = ns.Do(func() error {
-			if ipv6IsEnabled(ipam) {
-				if err := reserveLocalIPPorts(conf, sysctl); err != nil {
-					logger.WithError(err).Warn("unable to reserve local ip ports")
-				}
+			if err := reserveLocalIPPorts(conf, sysctl); err != nil {
+				logger.WithError(err).Warn("unable to reserve local ip ports")
+			}
 
-				if err := sysctl.Disable("net.ipv6.conf.all.disable_ipv6"); err != nil {
+			if ipv6IsEnabled(ipam) {
+				if err := sysctl.Disable([]string{"net", "ipv6", "conf", "all", "disable_ipv6"}); err != nil {
 					logger.WithError(err).Warn("unable to enable ipv6 on all interfaces")
 				}
 			}
@@ -675,12 +711,13 @@ func (cmd *Cmd) Add(args *skel.CmdArgs) (err error) {
 		}
 		if newEp != nil && newEp.Status != nil && newEp.Status.Networking != nil && newEp.Status.Networking.Mac != "" {
 			// Set the MAC address on the interface in the container namespace
-			err = ns.Do(func() error {
-				return mac.ReplaceMacAddressWithLinkName(args.IfName, newEp.Status.Networking.Mac)
-			})
-
-			if err != nil {
-				return fmt.Errorf("unable to set MAC address on interface %s: %w", args.IfName, err)
+			if conf.DatapathMode != datapathOption.DatapathModeNetkit {
+				err = ns.Do(func() error {
+					return mac.ReplaceMacAddressWithLinkName(args.IfName, newEp.Status.Networking.Mac)
+				})
+				if err != nil {
+					return fmt.Errorf("unable to set MAC address on interface %s: %w", args.IfName, err)
+				}
 			}
 			macAddrStr = newEp.Status.Networking.Mac
 		}
@@ -923,12 +960,12 @@ func verifyInterface(netnsPinPath, ifName string, expected *cniTypesV1.Result) e
 	}
 	defer ns.Close()
 	return ns.Do(func() error {
-		link, err := netlink.LinkByName(ifName)
+		link, err := safenetlink.LinkByName(ifName)
 		if err != nil {
 			return fmt.Errorf("cannot find container link %v", ifName)
 		}
 
-		addrList, err := netlink.AddrList(link, netlink.FAMILY_ALL)
+		addrList, err := safenetlink.AddrList(link, netlink.FAMILY_ALL)
 		if err != nil {
 			return fmt.Errorf("failed to list link addresses: %w", err)
 		}

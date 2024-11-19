@@ -20,8 +20,9 @@ on:
 
   push:
     branches:
-      - main
-      - ft/main/**
+      - v1.16
+      - ft/v1.16/**
+      - 'renovate/v1.16-**'
     paths-ignore:
       - 'Documentation/**'
 
@@ -63,19 +64,18 @@ jobs:
   echo-inputs:
     if: ${{ github.event_name == 'workflow_dispatch' }}
     name: Echo Workflow Dispatch Inputs
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Echo Workflow Dispatch Inputs
         run: |
           echo '${{ tojson(inputs) }}'
 
   commit-status-start:
-    if: ${{ github.event_name != 'push' }}
     name: Commit Status Start
     runs-on: ubuntu-latest
     steps:
       - name: Set initial commit status
-        uses: myrotvorets/set-commit-status-action@3730c0a348a2ace3c110851bed53331bc6406e9f # v2.0.1  
+        uses: myrotvorets/set-commit-status-action@3730c0a348a2ace3c110851bed53331bc6406e9f # v2.0.1
         with:
           sha: ${{ inputs.SHA || github.sha }}
 
@@ -83,7 +83,7 @@ jobs:
     name: Setup & Test
     # Ubuntu 22.04 runner uses cgroup v2-only which is needed for some
     # our LB functionality
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - name: Collect Workflow Telemetry
@@ -92,7 +92,7 @@ jobs:
           comment_on_pr: false
 
       - name: Checkout context ref (trusted)
-        uses: actions/checkout@44c2b7a8a4ea60a981eaca3cf939b5f4305c123b # v4.1.5
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ inputs.context-ref || github.sha }}
           persist-credentials: false
@@ -112,7 +112,7 @@ jobs:
           echo sha=${SHA} >> $GITHUB_OUTPUT
 
       - name: Install Cilium CLI
-        uses: cilium/cilium-cli@13cf0683b2662c27c691f4330c2ac0f48b429ce5 # v0.16.7
+        uses: cilium/cilium-cli@6977c4a640ad45da3a95eb12054497f2bdd22c48 # v0.16.19
         with:
           repository: ${{ env.CILIUM_CLI_RELEASE_REPO }}
           release-version: ${{ env.CILIUM_CLI_VERSION }}
@@ -133,19 +133,27 @@ jobs:
         run: |
           cd ${{ github.workspace }}/test/nat46x64 && sudo ./test.sh ${{ env.QUAY_ORGANIZATION_DEV }} ${{ steps.vars.outputs.sha }}
 
+      - name: Fetch DinD information
+        if: ${{ !success() && steps.lb-test.outcome != 'skipped' }}
+        run: |
+          docker ps -a
+          docker logs lb-node
+          docker inspect lb-node
+          docker exec -t lb-node docker ps
+
       - name: Fetch Cilium Standalone LB logs
         if: ${{ !success() && steps.lb-test.outcome != 'skipped' }}
         run: |
           docker exec -t lb-node docker logs cilium-lb
 
   commit-status-final:
-    if: ${{ always() && github.event_name != 'push' }}
+    if: ${{ always() }}
     name: Commit Status Final
     needs: setup-and-test
     runs-on: ubuntu-latest
     steps:
       - name: Set final commit status
-        uses: myrotvorets/set-commit-status-action@3730c0a348a2ace3c110851bed53331bc6406e9f # v2.0.1  
+        uses: myrotvorets/set-commit-status-action@3730c0a348a2ace3c110851bed53331bc6406e9f # v2.0.1
         with:
           sha: ${{ inputs.SHA || github.sha }}
           status: ${{ needs.setup-and-test.result }}

@@ -5,6 +5,7 @@ package policymap
 
 import (
 	"fmt"
+	"math/bits"
 	"strconv"
 	"strings"
 	"unsafe"
@@ -44,6 +45,10 @@ const (
 	// PressureMetricThreshold sets the threshold over which map pressure will
 	// be reported for the policy map.
 	PressureMetricThreshold = 0.1
+
+	// SinglePortMask represents the mask argument required to lookup or
+	// insert a single port key into the bpf map.
+	SinglePortMask = 0xffff
 )
 
 // policyEntryFlags is a new type used to define the flags used in the policy
@@ -52,12 +57,18 @@ type policyEntryFlags uint8
 
 const (
 	policyFlagDeny policyEntryFlags = 1 << iota
-	policyFlagWildcardNexthdr
-	policyFlagWildcardDestPort
+	policyFlagReserved1
+	policyFlagReserved2
+	policyFlagLPMShift         = iota
+	policyFlagMaskLPMPrefixLen = ((1 << 5) - 1) << policyFlagLPMShift
 )
 
 func (pef policyEntryFlags) is(pf policyEntryFlags) bool {
 	return pef&pf == pf
+}
+
+func (pef policyEntryFlags) getPrefixLen() uint8 {
+	return uint8(pef >> policyFlagLPMShift)
 }
 
 // String returns the string implementation of policyEntryFlags.
@@ -68,12 +79,6 @@ func (pef policyEntryFlags) String() string {
 		str = append(str, "Deny")
 	} else {
 		str = append(str, "Allow")
-	}
-	if pef.is(policyFlagWildcardNexthdr) {
-		str = append(str, "WildcardProtocol")
-	}
-	if pef.is(policyFlagWildcardDestPort) {
-		str = append(str, "WildcardPort")
 	}
 
 	return strings.Join(str, ", ")
@@ -97,7 +102,8 @@ func (pe PolicyEntry) IsDeny() bool {
 }
 
 func (pe *PolicyEntry) String() string {
-	return fmt.Sprintf("%d %d %d", pe.GetProxyPort(), pe.Packets, pe.Bytes)
+	prefixLen := pe.Flags.getPrefixLen()
+	return fmt.Sprintf("%d %d %d %d", pe.GetProxyPort(), prefixLen, pe.Packets, pe.Bytes)
 }
 
 func (pe *PolicyEntry) New() bpf.MapValue { return &PolicyEntry{} }
@@ -115,6 +121,23 @@ type PolicyKey struct {
 // GetDestPort returns the DestPortNetwork in host byte order
 func (k *PolicyKey) GetDestPort() uint16 {
 	return byteorder.NetworkToHost16(k.DestPortNetwork)
+}
+
+// GetPortMask returns the port mask of the key
+func (k *PolicyKey) GetPortMask() uint16 {
+	if k.DestPortNetwork == 0 {
+		return 0
+	}
+	prefixLen := k.Prefixlen - StaticPrefixBits
+	if prefixLen == FullPrefixBits {
+		return 0xffff
+	}
+	if prefixLen == 0 || prefixLen == NexthdrBits {
+		return 0
+	}
+	portPrefixLen := prefixLen - NexthdrBits
+	portLen := prefixLenPortLenMap[portPrefixLen]
+	return ^portLen
 }
 
 const (
@@ -136,8 +159,7 @@ type PolicyEntry struct {
 	ProxyPortNetwork uint16           `align:"proxy_port"` // In network byte-order
 	Flags            policyEntryFlags `align:"deny"`
 	AuthType         uint8            `align:"auth_type"`
-	Pad1             uint16           `align:"pad1"`
-	Pad2             uint16           `align:"pad2"`
+	Pad1             uint32           `align:"pad1"`
 	Packets          uint64           `align:"packets"`
 	Bytes            uint64           `align:"bytes"`
 }
@@ -147,10 +169,15 @@ func (pe *PolicyEntry) GetProxyPort() uint16 {
 	return byteorder.NetworkToHost16(pe.ProxyPortNetwork)
 }
 
+// GetPrefixLen returns the prefix length for the protocol / destination port
+// (0 to 24 bits, 8 bits for unwildcarded protocol + 0 - 16 bits for the port)
+func (pe *PolicyEntry) GetPrefixLen() uint8 {
+	return pe.Flags.getPrefixLen()
+}
+
 type policyEntryFlagParams struct {
-	IsDeny             bool
-	IsWildcardNexthdr  bool
-	IsWildcardDestPort bool
+	IsDeny    bool
+	PrefixLen uint8
 }
 
 // getPolicyEntryFlags returns a policyEntryFlags from the policyEntryFlagParams.
@@ -160,12 +187,8 @@ func getPolicyEntryFlags(p policyEntryFlagParams) policyEntryFlags {
 	if p.IsDeny {
 		flags |= policyFlagDeny
 	}
-	if p.IsWildcardNexthdr {
-		flags |= policyFlagWildcardNexthdr
-	}
-	if p.IsWildcardDestPort {
-		flags |= policyFlagWildcardDestPort
-	}
+
+	flags |= policyEntryFlags(p.PrefixLen << policyFlagLPMShift)
 
 	return flags
 }
@@ -230,10 +253,34 @@ func (p PolicyEntriesDump) Less(i, j int) bool {
 		p[i].Key.Identity < p[j].Key.Identity
 }
 
+// prefixLenPortLenMaskMap is the map of all the possible prefix lengths
+// of the port field in the policy key, corresponding to the port
+// length of that mask. The "16" prefix len implies a full mask (that is,
+// 0 additional ports) and makes the default return value, 0, useful.
+var prefixLenPortLenMap = map[uint32]uint16{
+	0:  0xffff,
+	1:  0x7fff,
+	2:  0x3fff,
+	3:  0x1fff,
+	4:  0xfff,
+	5:  0x7ff,
+	6:  0x3ff,
+	7:  0x1ff,
+	8:  0xff,
+	9:  0x7f,
+	10: 0x3f,
+	11: 0x1f,
+	12: 0xf,
+	13: 0x7,
+	14: 0x3,
+	15: 0x1,
+}
+
 func (key *PolicyKey) PortProtoString() string {
 	dport := key.GetDestPort()
 	protoStr := u8proto.U8proto(key.Nexthdr).String()
 	prefixLen := key.Prefixlen - StaticPrefixBits
+	portPrefixLen := prefixLen - NexthdrBits
 
 	switch {
 	case prefixLen == 0, prefixLen == NexthdrBits:
@@ -241,7 +288,8 @@ func (key *PolicyKey) PortProtoString() string {
 		return protoStr
 	case prefixLen > NexthdrBits && prefixLen < FullPrefixBits:
 		// Protocol specified, partially wildcarded port
-		return fmt.Sprintf("0x%x/%d/%s", dport, prefixLen-NexthdrBits, protoStr)
+		portLen := prefixLenPortLenMap[portPrefixLen]
+		return fmt.Sprintf("%d-%d/%s", dport, dport+portLen, protoStr)
 	case prefixLen == FullPrefixBits:
 		// Both protocol and port specified, nothing wildcarded
 		return fmt.Sprintf("%d/%s", dport, protoStr)
@@ -261,14 +309,13 @@ func (key *PolicyKey) New() bpf.MapKey { return &PolicyKey{} }
 
 // NewKey returns a PolicyKey representing the specified parameters in network
 // byte-order.
-func NewKey(id uint32, dport uint16, proto uint8, trafficDirection uint8) PolicyKey {
-	// For now prefix length is derived from the proto and dport values
-	// This will have to be exposed to the caller when port ranges are supported.
+func NewKey(id uint32, dport, mask uint16, proto uint8, trafficDirection uint8) PolicyKey {
+
 	prefixLen := StaticPrefixBits
-	if proto != 0 {
+	if proto != 0 || dport != 0 {
 		prefixLen += NexthdrBits
 		if dport != 0 {
-			prefixLen += DestPortBits
+			prefixLen += DestPortBits - uint32(bits.TrailingZeros16(mask))
 		}
 	}
 	return PolicyKey{
@@ -282,8 +329,8 @@ func NewKey(id uint32, dport uint16, proto uint8, trafficDirection uint8) Policy
 
 // newKey returns a PolicyKey representing the specified parameters in network
 // byte-order.
-func newKey(id uint32, dport uint16, proto u8proto.U8proto, trafficDirection trafficdirection.TrafficDirection) PolicyKey {
-	return NewKey(id, dport, uint8(proto), trafficDirection.Uint8())
+func newKey(id uint32, dport, portMask uint16, proto u8proto.U8proto, trafficDirection trafficdirection.TrafficDirection) PolicyKey {
+	return NewKey(id, dport, portMask, uint8(proto), trafficDirection.Uint8())
 }
 
 // newEntry returns a PolicyEntry representing the specified parameters in
@@ -301,8 +348,7 @@ func newEntry(authType uint8, proxyPort uint16, flags policyEntryFlags) PolicyEn
 // This is separated out to be used in unit testing.
 func newAllowEntry(key PolicyKey, authType uint8, proxyPort uint16) PolicyEntry {
 	pef := getPolicyEntryFlags(policyEntryFlagParams{
-		IsWildcardNexthdr:  key.Nexthdr == 0,
-		IsWildcardDestPort: key.DestPortNetwork == 0,
+		PrefixLen: uint8(key.Prefixlen - StaticPrefixBits),
 	})
 	return newEntry(authType, proxyPort, pef)
 }
@@ -312,9 +358,8 @@ func newAllowEntry(key PolicyKey, authType uint8, proxyPort uint16) PolicyEntry 
 // This is separated out to be used in unit testing.
 func newDenyEntry(key PolicyKey) PolicyEntry {
 	pef := getPolicyEntryFlags(policyEntryFlagParams{
-		IsDeny:             true,
-		IsWildcardNexthdr:  key.Nexthdr == 0,
-		IsWildcardDestPort: key.DestPortNetwork == 0,
+		IsDeny:    true,
+		PrefixLen: uint8(key.Prefixlen - StaticPrefixBits),
 	})
 	return newEntry(0, 0, pef)
 }
@@ -329,8 +374,8 @@ func (pm *PolicyMap) AllowKey(key PolicyKey, authType uint8, proxyPort uint16) e
 // Allow pushes an entry into the PolicyMap to allow traffic in the given
 // `trafficDirection` for identity `id` with destination port `dport` over
 // protocol `proto`. It is assumed that `dport` and `proxyPort` are in host byte-order.
-func (pm *PolicyMap) Allow(id uint32, dport uint16, proto u8proto.U8proto, trafficDirection trafficdirection.TrafficDirection, authType uint8, proxyPort uint16) error {
-	key := newKey(id, dport, proto, trafficDirection)
+func (pm *PolicyMap) Allow(id uint32, dport, portMask uint16, proto u8proto.U8proto, trafficDirection trafficdirection.TrafficDirection, authType uint8, proxyPort uint16) error {
+	key := newKey(id, dport, portMask, proto, trafficDirection)
 	return pm.AllowKey(key, authType, proxyPort)
 }
 
@@ -344,16 +389,16 @@ func (pm *PolicyMap) DenyKey(key PolicyKey) error {
 // Deny pushes an entry into the PolicyMap to deny traffic in the given
 // `trafficDirection` for identity `id` with destination port `dport` over
 // protocol `proto`. It is assumed that `dport` is in host byte-order.
-func (pm *PolicyMap) Deny(id uint32, dport uint16, proto u8proto.U8proto, trafficDirection trafficdirection.TrafficDirection) error {
-	key := newKey(id, dport, proto, trafficDirection)
+func (pm *PolicyMap) Deny(id uint32, dport, portMask uint16, proto u8proto.U8proto, trafficDirection trafficdirection.TrafficDirection) error {
+	key := newKey(id, dport, portMask, proto, trafficDirection)
 	return pm.DenyKey(key)
 }
 
 // Exists determines whether PolicyMap currently contains an entry that
 // allows traffic in `trafficDirection` for identity `id` with destination port
 // `dport`over protocol `proto`. It is assumed that `dport` is in host byte-order.
-func (pm *PolicyMap) Exists(id uint32, dport uint16, proto u8proto.U8proto, trafficDirection trafficdirection.TrafficDirection) bool {
-	key := newKey(id, dport, proto, trafficDirection)
+func (pm *PolicyMap) Exists(id uint32, dport, portMask uint16, proto u8proto.U8proto, trafficDirection trafficdirection.TrafficDirection) bool {
+	key := newKey(id, dport, portMask, proto, trafficDirection)
 	_, err := pm.Lookup(&key)
 	return err == nil
 }
@@ -368,8 +413,8 @@ func (pm *PolicyMap) DeleteKey(key PolicyKey) error {
 // sending traffic in direction `trafficDirection` with destination port `dport`
 // over protocol `proto`. It is assumed that `dport` is in host byte-order.
 // Returns an error if the deletion did not succeed.
-func (pm *PolicyMap) Delete(id uint32, dport uint16, proto u8proto.U8proto, trafficDirection trafficdirection.TrafficDirection) error {
-	k := newKey(id, dport, proto, trafficDirection)
+func (pm *PolicyMap) Delete(id uint32, dport, portMask uint16, proto u8proto.U8proto, trafficDirection trafficdirection.TrafficDirection) error {
+	k := newKey(id, dport, portMask, proto, trafficDirection)
 	return pm.Map.Delete(&k)
 }
 
@@ -409,6 +454,21 @@ func (pm *PolicyMap) DumpToSlice() (PolicyEntriesDump, error) {
 	err := pm.DumpWithCallback(cb)
 
 	return entries, err
+}
+
+// DumpValid calls 'cb' for each key/value in the policy map where the prefix length fields
+// in the key and value agree. This should be used to filter out invalid entries so that
+// they will be rewritten with the valid values.
+func (pm *PolicyMap) DumpValid(cb func(key *PolicyKey, value *PolicyEntry)) error {
+	return pm.DumpWithCallback(func(key bpf.MapKey, value bpf.MapValue) {
+		k := key.(*PolicyKey)
+		v := value.(*PolicyEntry)
+
+		// Call 'cb' only for entries with valid prefix len
+		if v.GetPrefixLen() == uint8(k.Prefixlen-StaticPrefixBits) {
+			cb(k, v)
+		}
+	})
 }
 
 func newMap(path string) *PolicyMap {
@@ -456,7 +516,7 @@ func InitMapInfo(maxEntries int) {
 }
 
 // InitCallMap creates the policy call maps in the kernel.
-func InitCallMaps(haveEgressCallMap bool) error {
+func InitCallMaps() error {
 	policyCallMap := bpf.NewMap(PolicyCallMapName,
 		ebpf.ProgramArray,
 		&CallKey{},
@@ -466,7 +526,7 @@ func InitCallMaps(haveEgressCallMap bool) error {
 	)
 	err := policyCallMap.Create()
 
-	if err == nil && haveEgressCallMap {
+	if err == nil {
 		policyEgressCallMap := bpf.NewMap(PolicyEgressCallMapName,
 			ebpf.ProgramArray,
 			&CallKey{},

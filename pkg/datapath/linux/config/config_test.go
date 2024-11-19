@@ -16,11 +16,11 @@ import (
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/cilium/hive/cell"
 	"github.com/cilium/hive/hivetest"
-	"github.com/cilium/statedb"
 	"github.com/spf13/afero"
 	"github.com/stretchr/testify/require"
 	"github.com/vishvananda/netlink"
 
+	"github.com/cilium/cilium/pkg/cidr"
 	fakeTypes "github.com/cilium/cilium/pkg/datapath/fake/types"
 	dpdef "github.com/cilium/cilium/pkg/datapath/linux/config/defines"
 	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
@@ -30,14 +30,21 @@ import (
 	"github.com/cilium/cilium/pkg/hive"
 	"github.com/cilium/cilium/pkg/maps/nodemap"
 	"github.com/cilium/cilium/pkg/maps/nodemap/fake"
-	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/testutils"
 )
 
 var (
 	dummyNodeCfg = datapath.LocalNodeConfiguration{
-		MtuConfig: &fakeTypes.MTU{},
+		NodeIPv4:           ipv4DummyAddr.AsSlice(),
+		NodeIPv6:           ipv6DummyAddr.AsSlice(),
+		CiliumInternalIPv4: ipv4DummyAddr.AsSlice(),
+		CiliumInternalIPv6: ipv6DummyAddr.AsSlice(),
+		AllocCIDRIPv4:      cidr.MustParseCIDR("10.147.0.0/16"),
+		LoopbackIPv4:       ipv4DummyAddr.AsSlice(),
+		Devices:            []*tables.Device{},
+		NodeAddresses:      []tables.NodeAddress{},
+		HostEndpointID:     1,
 	}
 	dummyDevCfg   = testutils.NewTestEndpoint()
 	dummyEPCfg    = testutils.NewTestEndpoint()
@@ -53,12 +60,6 @@ func setupConfigSuite(tb testing.TB) {
 	require.NoError(tb, rlimit.RemoveMemlock(), "Failed to remove memory limits")
 
 	option.Config.EnableHostLegacyRouting = true // Disable obtaining direct routing device.
-	node.SetTestLocalNodeStore()
-	node.InitDefaultPrefix("")
-	node.SetInternalIPv4Router(ipv4DummyAddr.AsSlice())
-	node.SetIPv4Loopback(ipv4DummyAddr.AsSlice())
-
-	tb.Cleanup(node.UnsetTestLocalNodeStore)
 }
 
 type badWriter struct{}
@@ -92,17 +93,9 @@ func writeConfig(t *testing.T, header string, write writeFn) {
 		h := hive.New(
 			provideNodemap,
 			cell.Provide(
-				tables.NewNodeAddressTable,
-				statedb.RWTable[tables.NodeAddress].ToTable,
-				tables.NewDeviceTable,
-				statedb.RWTable[*tables.Device].ToTable,
 				fakeTypes.NewNodeAddressing,
 				func() sysctl.Sysctl { return sysctl.NewDirectSysctl(afero.NewOsFs(), "/proc") },
 				NewHeaderfileWriter,
-			),
-			cell.Invoke(
-				statedb.RegisterTable[*tables.Device],
-				statedb.RegisterTable[tables.NodeAddress],
 			),
 			cell.Invoke(func(writer_ datapath.ConfigWriter) {
 				writer = writer_
@@ -112,7 +105,8 @@ func writeConfig(t *testing.T, header string, write writeFn) {
 		tlog := hivetest.Logger(t)
 		require.NoError(t, h.Start(tlog, context.TODO()))
 		t.Cleanup(func() { require.Nil(t, h.Stop(tlog, context.TODO())) })
-		require.True(t, test.wantErr != (write(test.output, writer) == nil))
+		err := write(test.output, writer)
+		require.True(t, test.wantErr == (err != nil), "wantErr=%v, err=%s", test.wantErr, err)
 	}
 }
 
@@ -131,7 +125,7 @@ func TestWriteNetdevConfig(t *testing.T) {
 
 func TestWriteEndpointConfig(t *testing.T) {
 	writeConfig(t, "endpoint", func(w io.Writer, dp datapath.ConfigWriter) error {
-		return dp.WriteEndpointConfig(w, &dummyEPCfg)
+		return dp.WriteEndpointConfig(w, &dummyNodeCfg, &dummyEPCfg)
 	})
 
 	// Create copy of config option so that it can be restored at the end of
@@ -143,14 +137,14 @@ func TestWriteEndpointConfig(t *testing.T) {
 		option.Config.EnableIPv6 = oldEnableIPv6
 	}()
 
-	testRun := func(te *testutils.TestEndpoint) ([]byte, map[string]uint64, map[string]string) {
+	testRun := func(te *testutils.TestEndpoint) ([]byte, map[string]uint64) {
 		cfg := &HeaderfileWriter{}
-		varSub, stringSub := loader.NewLoaderForTest(t).ELFSubstitutions(te)
+		varSub := loader.ELFVariableSubstitutions(te)
 
 		var buf bytes.Buffer
 		cfg.writeStaticData(nil, &buf, te)
 
-		return buf.Bytes(), varSub, stringSub
+		return buf.Bytes(), varSub
 	}
 
 	lxcIPs := []string{"LXC_IP_1", "LXC_IP_2"}
@@ -216,11 +210,11 @@ func TestWriteEndpointConfig(t *testing.T) {
 		t.Logf("Testing %s", test.description)
 		test.preTestRun(&test.template, &test.endpoint)
 
-		b, vsub, _ := testRun(&test.template)
+		b, vsub := testRun(&test.template)
 		require.Equal(t, test.templateExp, bytes.Contains(b, []byte("DEFINE_IPV6")))
 		assertKeysInsideMap(t, vsub, lxcIPs, test.templateExp)
 
-		b, vsub, _ = testRun(&test.endpoint)
+		b, vsub = testRun(&test.endpoint)
 		require.Equal(t, test.endpointExp, bytes.Contains(b, []byte("DEFINE_IPV6")))
 		assertKeysInsideMap(t, vsub, lxcIPs, test.endpointExp)
 	}
@@ -230,7 +224,8 @@ func TestWriteStaticData(t *testing.T) {
 	cfg := &HeaderfileWriter{}
 	ep := &dummyEPCfg
 
-	varSub, stringSub := loader.NewLoaderForTest(t).ELFSubstitutions(ep)
+	varSub := loader.ELFVariableSubstitutions(ep)
+	mapSub := loader.ELFMapSubstitutions(ep)
 
 	var buf bytes.Buffer
 	cfg.writeStaticData(nil, &buf, ep)
@@ -247,12 +242,8 @@ func TestWriteStaticData(t *testing.T) {
 		}
 		require.Equal(t, true, bytes.Contains(b, []byte(k)))
 	}
-	for _, v := range stringSub {
+	for _, v := range mapSub {
 		t.Logf("Ensuring config has %s", v)
-		if strings.HasPrefix(v, "1/0x") {
-			// Skip tail call map name replacement
-			continue
-		}
 		require.Equal(t, true, bytes.Contains(b, []byte(v)))
 	}
 }
@@ -371,32 +362,15 @@ func TestWriteNodeConfigExtraDefines(t *testing.T) {
 	setupConfigSuite(t)
 
 	var (
-		db        *statedb.DB
-		devices   statedb.Table[*tables.Device]
-		nodeAddrs statedb.Table[tables.NodeAddress]
-		na        datapath.NodeAddressing
+		na datapath.NodeAddressing
 	)
 	h := hive.New(
 		cell.Provide(
 			fakeTypes.NewNodeAddressing,
-			tables.NewDeviceTable,
-			tables.NewNodeAddressTable,
-			statedb.RWTable[*tables.Device].ToTable,
-			statedb.RWTable[tables.NodeAddress].ToTable,
-		),
-		cell.Invoke(
-			statedb.RegisterTable[*tables.Device],
-			statedb.RegisterTable[tables.NodeAddress],
 		),
 		cell.Invoke(func(
-			db_ *statedb.DB,
-			devices_ statedb.Table[*tables.Device],
-			nodeAddrs_ statedb.Table[tables.NodeAddress],
 			nodeaddressing datapath.NodeAddressing,
 		) {
-			db = db_
-			devices = devices_
-			nodeAddrs = nodeAddrs_
 			na = nodeaddressing
 		}),
 	)
@@ -409,9 +383,6 @@ func TestWriteNodeConfigExtraDefines(t *testing.T) {
 
 	// Assert that configurations are propagated when all generated extra defines are valid
 	cfg, err := NewHeaderfileWriter(WriterParams{
-		DB:               db,
-		Devices:          devices,
-		NodeAddresses:    nodeAddrs,
 		NodeAddressing:   na,
 		NodeExtraDefines: nil,
 		NodeExtraDefineFns: []dpdef.Fn{
@@ -433,9 +404,6 @@ func TestWriteNodeConfigExtraDefines(t *testing.T) {
 
 	// Assert that an error is returned when one extra define function returns an error
 	cfg, err = NewHeaderfileWriter(WriterParams{
-		DB:               db,
-		Devices:          devices,
-		NodeAddresses:    nodeAddrs,
 		NodeAddressing:   fakeTypes.NewNodeAddressing(),
 		NodeExtraDefines: nil,
 		NodeExtraDefineFns: []dpdef.Fn{
@@ -451,9 +419,6 @@ func TestWriteNodeConfigExtraDefines(t *testing.T) {
 
 	// Assert that an error is returned when one extra define would overwrite an already existing entry
 	cfg, err = NewHeaderfileWriter(WriterParams{
-		DB:               db,
-		Devices:          devices,
-		NodeAddresses:    nodeAddrs,
 		NodeAddressing:   fakeTypes.NewNodeAddressing(),
 		NodeExtraDefines: nil,
 		NodeExtraDefineFns: []dpdef.Fn{
@@ -476,19 +441,7 @@ func TestNewHeaderfileWriter(t *testing.T) {
 	a := dpdef.Map{"A": "1"}
 	var buffer bytes.Buffer
 
-	nodeAddrs, err := tables.NewNodeAddressTable()
-	require.NoError(t, err)
-
-	devices, err := tables.NewDeviceTable()
-	require.NoError(t, err)
-
-	db := statedb.New()
-	require.NoError(t, db.RegisterTable(devices, nodeAddrs), "RegisterTable")
-
-	_, err = NewHeaderfileWriter(WriterParams{
-		DB:                 db,
-		Devices:            devices,
-		NodeAddresses:      nodeAddrs,
+	_, err := NewHeaderfileWriter(WriterParams{
 		NodeAddressing:     fakeTypes.NewNodeAddressing(),
 		NodeExtraDefines:   []dpdef.Map{a, a},
 		NodeExtraDefineFns: nil,
@@ -499,9 +452,6 @@ func TestNewHeaderfileWriter(t *testing.T) {
 	require.Error(t, err, "duplicate keys should be rejected")
 
 	cfg, err := NewHeaderfileWriter(WriterParams{
-		DB:                 db,
-		Devices:            devices,
-		NodeAddresses:      nodeAddrs,
 		NodeAddressing:     fakeTypes.NewNodeAddressing(),
 		NodeExtraDefines:   []dpdef.Map{a},
 		NodeExtraDefineFns: nil,

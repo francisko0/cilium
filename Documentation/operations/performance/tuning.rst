@@ -12,6 +12,131 @@ Tuning Guide
 
 This guide helps you optimize a Cilium installation for optimal performance.
 
+Recommendation
+==============
+
+The default out of the box deployment of Cilium is focused on maximum compatibility
+rather than most optimal performance. If you are a performance-conscious user, here
+are the recommended settings for operating Cilium to get the best out of your setup.
+
+.. note::
+    In-place upgrade by just enabling the config settings on an existing
+    cluster is not possible since these tunings change the underlying datapath
+    fundamentals and therefore require Pod or even node restarts.
+
+    The best way to consume this for an existing cluster is to utilize per-node
+    configuration for enabling the tunings only on newly spawned nodes which join
+    the cluster. See the :ref:`per-node-configuration` page for more details.
+
+Each of the settings for the recommended performance profile are described in more
+detail on this page and in this `KubeCon talk <https://sched.co/1R2s5>`__:
+
+- netkit device mode
+- eBPF host-routing
+- BIG TCP for IPv4/IPv6
+- Bandwidth Manager (optional, for BBR congestion control)
+
+**Requirements:**
+
+* Kernel >= 6.8
+* Supported NICs for BIG TCP: mlx4, mlx5, ice
+
+To enable the first three settings:
+
+.. tabs::
+
+    .. group-tab:: Helm
+
+       .. parsed-literal::
+
+           helm install cilium |CHART_RELEASE| \\
+             --namespace kube-system \\
+             --set routingMode=native \\
+             --set bpf.datapathMode=netkit \\
+             --set bpf.masquerade=true \\
+             --set ipv6.enabled=true \\
+             --set enableIPv6BIGTCP=true \\
+             --set ipv4.enabled=true \\
+             --set enableIPv4BIGTCP=true \\
+             --set kubeProxyReplacement=true
+
+For enabling BBR congestion control in addition, consider adding the following
+settings to the above Helm install:
+
+.. tabs::
+
+    .. group-tab:: Helm
+
+       .. parsed-literal::
+
+             --set bandwidthManager.enabled=true \\
+             --set bandwidthManager.bbr=true
+
+.. _netkit:
+
+netkit device mode
+==================
+
+netkit devices provide connectivity for Pods with the goal to improve throughput
+and latency for applications as if they would have resided directly in the host
+namespace, meaning, it reduces the datapath overhead for network namespaces down
+to zero. The `netkit driver in the kernel <https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/net/netkit.c>`__
+has been specifically designed for Cilium's needs and replaces the old-style veth
+device type. See also the `KubeCon talk on netkit <https://sched.co/1R2s5>`__ for
+more details.
+
+Cilium utilizes netkit in L3 device mode with blackholing traffic from the Pods
+when there is no BPF program attached. The Pod specific BPF programs are attached
+inside the netkit peer device, and can only be managed from the host namespace
+through Cilium. netkit in combination with eBPF-based host-routing achieves a
+fast network namespace switch for off-node traffic ingressing into the Pod or
+leaving the Pod. When netkit is enabled, Cilium also utilizes tcx for all
+attachments to non-netkit devices. This is done for higher efficiency as well
+as utilizing BPF links for all Cilium attachments. netkit is available for kernel
+6.8 and onwards and it also supports BIG TCP. Once the base kernels become more
+ubiquitous, the veth device mode of Cilium will be deprecated.
+
+To validate whether your installation is running with netkit, run ``cilium status``
+in any of the Cilium Pods and look for the line reporting the status for
+"Device Mode" which should state "netkit". Also, ensure to have eBPF host
+routing enabled - the reporting status under "Host Routing" must state "BPF".
+
+.. warning::
+    This is a beta feature. Please provide feedback and file a GitHub issue if
+    you experience any problems. Known issues with this feature are tracked
+    `here <https://github.com/cilium/cilium/issues?q=is%3Aissue%20label%3Afeature%2Fnetkit%20>`_.
+
+.. note::
+    In-place upgrade by just enabling netkit on an existing cluster is not
+    possible since the CNI plugin cannot simply replace veth with netkit after
+    Pod creation. Also, running both flavors in parallel is currently not
+    supported.
+
+    The best way to consume this for an existing cluster is to utilize per-node
+    configuration for enabling netkit on newly spawned nodes which join the
+    cluster. See the :ref:`per-node-configuration` page for more details.
+
+**Requirements:**
+
+* Kernel >= 6.8
+* Direct-routing configuration or tunneling
+* eBPF host-routing
+
+To enable netkit device mode with eBPF host-routing:
+
+.. tabs::
+
+    .. group-tab:: Helm
+
+       .. parsed-literal::
+
+           helm install cilium |CHART_RELEASE| \\
+             --namespace kube-system \\
+             --set routingMode=native \\
+             --set bpf.datapathMode=netkit \\
+             --set bpf.masquerade=true \\
+             --set kubeProxyReplacement=true
+
 .. _eBPF_Host_Routing:
 
 eBPF Host-Routing
@@ -64,6 +189,16 @@ respectively when BIG TCP is disabled and the current maximum values are more
 than 64k it will try to decrease them.
 
 BIG TCP doesn't require network interface MTU changes.
+
+.. note::
+    In-place upgrade by just enabling BIG TCP on an existing cluster is currently
+    not possible since Cilium does not have access into Pods after they have been
+    created.
+
+    The best way to consume this for an existing cluster is to either restart Pods
+    or to utilize per-node configuration for enabling BIG TCP on newly spawned nodes
+    which join the cluster. See the :ref:`per-node-configuration` page for more
+    details.
 
 **Requirements:**
 
@@ -121,6 +256,16 @@ respectively when BIG TCP is disabled and the current maximum values are more
 than 64k it will try to decrease them.
 
 BIG TCP doesn't require network interface MTU changes.
+
+.. note::
+    In-place upgrade by just enabling BIG TCP on an existing cluster is currently
+    not possible since Cilium does not have access into Pods after they have been
+    created.
+
+    The best way to consume this for an existing cluster is to either restart Pods
+    or to utilize per-node configuration for enabling BIG TCP on newly spawned nodes
+    which join the cluster. See the :ref:`per-node-configuration` page for more
+    details.
 
 **Requirements:**
 
@@ -267,7 +412,6 @@ settings for the networking stack.
 
 **Requirements:**
 
-* Kernel >= 5.1
 * Direct-routing configuration or tunneling
 * eBPF-based kube-proxy replacement
 
@@ -312,6 +456,18 @@ BBR also needs eBPF Host-Routing in order to retain the network packet's socket
 association all the way until the packet hits the FQ queueing discipline on the
 physical device in the host namespace.
 
+.. note::
+    In-place upgrade by just enabling BBR on an existing cluster is not possible
+    since Cilium cannot migrate existing sockets over to BBR congestion control.
+
+    The best way to consume this is to either only enable it on newly built clusters,
+    to restart Pods on existing clusters, or to utilize per-node configuration for
+    enabling BBR on newly spawned nodes which join the cluster. See the
+    :ref:`per-node-configuration` page for more details.
+
+    Note that the use of BBR could lead to a higher amount of TCP retransmissions
+    and more aggressive behavior towards TCP CUBIC connections.
+
 **Requirements:**
 
 * Kernel >= 5.18
@@ -355,7 +511,6 @@ is dramatically increased. The kube-proxy replacement at the XDP layer is
 
 * Kernel >= 4.19.57, >= 5.1.16, >= 5.2
 * Native XDP supported driver, check :ref:`our driver list <XDP acceleration>`
-* Direct-routing configuration
 * eBPF-based kube-proxy replacement
 
 To enable the XDP Acceleration, check out :ref:`our getting started guide <XDP acceleration>` which also contains instructions for setting it

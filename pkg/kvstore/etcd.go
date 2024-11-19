@@ -9,7 +9,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"net/url"
+	"math/rand/v2"
 	"os"
 	"strconv"
 	"strings"
@@ -33,7 +33,6 @@ import (
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/option"
-	"github.com/cilium/cilium/pkg/rand"
 	ciliumrate "github.com/cilium/cilium/pkg/rate"
 	ciliumratemetrics "github.com/cilium/cilium/pkg/rate/metrics"
 	"github.com/cilium/cilium/pkg/spanstat"
@@ -45,7 +44,6 @@ const (
 	EtcdBackendName = "etcd"
 
 	EtcdAddrOption               = "etcd.address"
-	isEtcdOperatorOption         = "etcd.operator"
 	EtcdOptionConfig             = "etcd.config"
 	EtcdOptionKeepAliveHeartbeat = "etcd.keepaliveHeartbeat"
 	EtcdOptionKeepAliveTimeout   = "etcd.keepaliveTimeout"
@@ -68,13 +66,9 @@ const (
 	etcdMaxKeysPerLease = 1000
 )
 
-var (
-	// ErrLockLeaseExpired is an error whenever the lease of the lock does not
-	// exist or it was expired.
-	ErrLockLeaseExpired = errors.New("transaction did not succeed: lock lease expired")
-
-	randGen = rand.NewSafeRand(time.Now().UnixNano())
-)
+// ErrLockLeaseExpired is an error whenever the lease of the lock does not
+// exist or it was expired.
+var ErrLockLeaseExpired = errors.New("transaction did not succeed: lock lease expired")
 
 type etcdModule struct {
 	opts   backendOptions
@@ -108,9 +102,6 @@ func EtcdDummyAddress() string {
 func newEtcdModule() backendModule {
 	return &etcdModule{
 		opts: backendOptions{
-			isEtcdOperatorOption: &backendOption{
-				description: "if the configuration is setting up an etcd-operator",
-			},
 			EtcdAddrOption: &backendOption{
 				description: "Addresses of etcd cluster",
 			},
@@ -193,7 +184,7 @@ func (e *etcdModule) getConfig() map[string]string {
 }
 
 func shuffleEndpoints(endpoints []string) {
-	randGen.Shuffle(len(endpoints), func(i, j int) {
+	rand.Shuffle(len(endpoints), func(i, j int) {
 		endpoints[i], endpoints[j] = endpoints[j], endpoints[i]
 	})
 }
@@ -440,7 +431,7 @@ func (e *etcdClient) waitForInitLock(ctx context.Context) <-chan error {
 
 			// Generate a random number so that we can acquire a lock even
 			// if other agents are killed while locking this path.
-			randNumber := strconv.FormatUint(randGen.Uint64(), 16)
+			randNumber := strconv.FormatUint(rand.Uint64(), 16)
 			locker, err := e.LockPath(ctx, InitLockPath+"/"+randNumber)
 			if err == nil {
 				locker.Unlock(context.Background())
@@ -772,6 +763,7 @@ func (e *etcdClient) DeletePrefix(ctx context.Context, path string) (err error) 
 
 // watch starts watching for changes in a prefix
 func (e *etcdClient) watch(ctx context.Context, w *Watcher) {
+	scope := GetScopeFromKey(strings.TrimRight(w.Prefix, "/"))
 	localCache := watcherCache{}
 	listSignalSent := false
 
@@ -847,13 +839,13 @@ reList:
 				scopedLog.Debugf("Emitting list result as %s event for %s=%s", t, key.Key, key.Value)
 			}
 
-			queueStart := spanstat.Start()
-			w.Events <- KeyValueEvent{
+			if !w.emit(ctx, scope, KeyValueEvent{
 				Key:   string(key.Key),
 				Value: key.Value,
 				Typ:   t,
+			}) {
+				return
 			}
-			trackEventQueued(string(key.Key), t, queueStart.End(true).Total())
 		}
 
 		nextRev := revision + 1
@@ -861,7 +853,7 @@ reList:
 		// Send out deletion events for all keys that were deleted
 		// between our last known revision and the latest revision
 		// received via Get
-		localCache.RemoveDeleted(func(k string) {
+		if !localCache.RemoveDeleted(func(k string) bool {
 			event := KeyValueEvent{
 				Key: k,
 				Typ: EventTypeDelete,
@@ -870,15 +862,16 @@ reList:
 			if traceEnabled {
 				scopedLog.Debugf("Emitting EventTypeDelete event for %s", k)
 			}
-
-			queueStart := spanstat.Start()
-			w.Events <- event
-			trackEventQueued(k, EventTypeDelete, queueStart.End(true).Total())
-		})
+			return w.emit(ctx, scope, event)
+		}) {
+			return
+		}
 
 		// Only send the list signal once
 		if !listSignalSent {
-			w.Events <- KeyValueEvent{Typ: EventTypeListDone}
+			if !w.emit(ctx, scope, KeyValueEvent{Typ: EventTypeListDone}) {
+				return
+			}
 			listSignalSent = true
 		}
 
@@ -891,6 +884,8 @@ reList:
 			case <-e.client.Ctx().Done():
 				return
 			case <-ctx.Done():
+				return
+			case <-w.stopWatch:
 				return
 			default:
 				goto recreateWatcher
@@ -960,10 +955,9 @@ reList:
 					if traceEnabled {
 						scopedLog.Debugf("Emitting %s event for %s=%s", event.Typ, event.Key, event.Value)
 					}
-
-					queueStart := spanstat.Start()
-					w.Events <- event
-					trackEventQueued(string(ev.Kv.Key), event.Typ, queueStart.End(true).Total())
+					if !w.emit(ctx, scope, event) {
+						return
+					}
 				}
 			}
 		}
@@ -994,7 +988,14 @@ func (e *etcdClient) paginatedList(ctx context.Context, log *logrus.Entry, prefi
 
 		kvs = append(kvs, res.Kvs...)
 
-		revision = res.Header.Revision
+		// Do not modify the revision once set, as subsequent Get queries may
+		// return higher revisions in case other operations are performed in
+		// parallel (regardless of whether we specify WithRev), leading to
+		// possibly missing the events happened in the meantime.
+		if revision == 0 {
+			revision = res.Header.Revision
+		}
+
 		if !res.More || len(res.Kvs) == 0 {
 			return kvs, revision, nil
 		}
@@ -1536,7 +1537,7 @@ func (e *etcdClient) ListPrefix(ctx context.Context, prefix string) (v KeyValueP
 }
 
 // Close closes the etcd session
-func (e *etcdClient) Close(ctx context.Context) {
+func (e *etcdClient) Close() {
 	close(e.stopStatusChecker)
 
 	if err := e.client.Close(); err != nil {
@@ -1628,73 +1629,6 @@ func (e *etcdClient) UserEnforceAbsence(ctx context.Context, name string) error 
 	}
 
 	return nil
-}
-
-// SplitK8sServiceURL returns the service name and namespace for the given address.
-// If the given address is not parseable or it is not the format
-// '<protocol>://><name>.<namespace>[optional]', returns an error.
-func SplitK8sServiceURL(address string) (string, string, error) {
-	u, err := url.Parse(address)
-	if err != nil {
-		return "", "", err
-	}
-	// typical service name "cilium-etcd-client.kube-system.svc"
-	names := strings.Split(u.Hostname(), ".")
-	if len(names) >= 2 {
-		return names[0], names[1], nil
-	}
-	return "", "",
-		fmt.Errorf("invalid service name. expecting <protocol://><name>.<namespace>[optional], got: %s", address)
-}
-
-// IsEtcdOperator returns the service name if the configuration is setting up an
-// etcd-operator. If the configuration explicitly states it is configured
-// to connect to an etcd operator, e.g. with etcd.operator=true, the returned
-// service name is the first found within the configuration specified.
-func IsEtcdOperator(selectedBackend string, opts map[string]string, k8sNamespace string) (string, bool) {
-	if selectedBackend != EtcdBackendName {
-		return "", false
-	}
-
-	isEtcdOperator := strings.ToLower(opts[isEtcdOperatorOption]) == "true"
-
-	fqdnIsEtcdOperator := func(address string) bool {
-		svcName, ns, err := SplitK8sServiceURL(address)
-		return err == nil &&
-			svcName == "cilium-etcd-client" &&
-			ns == k8sNamespace
-	}
-
-	fqdn := opts[EtcdAddrOption]
-	if len(fqdn) != 0 {
-		if fqdnIsEtcdOperator(fqdn) || isEtcdOperator {
-			return fqdn, true
-		}
-		return "", false
-	}
-
-	bm := newEtcdModule()
-	err := bm.setConfig(opts)
-	if err != nil {
-		return "", false
-	}
-	etcdConfig := bm.getConfig()[EtcdOptionConfig]
-	if len(etcdConfig) == 0 {
-		return "", false
-	}
-
-	cfg, err := newConfig(etcdConfig)
-	if err != nil {
-		log.WithError(err).Error("Unable to read etcd configuration.")
-		return "", false
-	}
-	for _, endpoint := range cfg.Endpoints {
-		if fqdnIsEtcdOperator(endpoint) || isEtcdOperator {
-			return endpoint, true
-		}
-	}
-
-	return "", false
 }
 
 // newConfig is a wrapper of clientyaml.NewConfig. Since etcd has deprecated

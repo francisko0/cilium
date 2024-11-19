@@ -163,6 +163,7 @@ type IPIdentityWatcher struct {
 
 	clusterName                string
 	clusterID                  uint32
+	source                     source.Source
 	withSelfDeletionProtection bool
 
 	started bool
@@ -176,10 +177,14 @@ type IPCacher interface {
 }
 
 // NewIPIdentityWatcher creates a new IPIdentityWatcher for the given cluster.
-func NewIPIdentityWatcher(clusterName string, ipc IPCacher, factory storepkg.Factory, opts ...storepkg.RWSOpt) *IPIdentityWatcher {
+func NewIPIdentityWatcher(
+	clusterName string, ipc IPCacher, factory storepkg.Factory,
+	source source.Source, opts ...storepkg.RWSOpt,
+) *IPIdentityWatcher {
 	watcher := IPIdentityWatcher{
 		ipcache:     ipc,
 		clusterName: clusterName,
+		source:      source,
 		synced:      make(chan struct{}),
 		log:         log.WithField(logfields.ClusterName, clusterName),
 	}
@@ -336,7 +341,7 @@ func (iw *IPIdentityWatcher) OnUpdate(k storepkg.Key) {
 	// endpoint is gone.
 	iw.ipcache.Upsert(ip, ipIDPair.HostIP, ipIDPair.Key, k8sMeta, Identity{
 		ID:     peerIdentity,
-		Source: source.KVStore,
+		Source: iw.source,
 	})
 }
 
@@ -368,7 +373,7 @@ func (iw *IPIdentityWatcher) OnDelete(k storepkg.NamedKey) {
 	// The key no longer exists in the
 	// local cache, it is safe to remove
 	// from the datapath ipcache.
-	iw.ipcache.Delete(ip, source.KVStore)
+	iw.ipcache.Delete(ip, iw.source)
 }
 
 func (iw *IPIdentityWatcher) onSync(context.Context) {
@@ -392,10 +397,6 @@ func (iw *IPIdentityWatcher) selfDeletionProtection(ip string) bool {
 	return false
 }
 
-func (iw *IPIdentityWatcher) waitForInitialSync() {
-	<-iw.synced
-}
-
 var (
 	watcher     *IPIdentityWatcher
 	initialized = make(chan struct{})
@@ -407,7 +408,7 @@ func (ipc *IPCache) InitIPIdentityWatcher(ctx context.Context, factory storepkg.
 	setupIPIdentityWatcher.Do(func() {
 		go func() {
 			log.Info("Starting IP identity watcher")
-			watcher = NewIPIdentityWatcher(option.Config.ClusterName, ipc, factory)
+			watcher = NewIPIdentityWatcher(option.Config.ClusterName, ipc, factory, source.KVStore)
 			close(initialized)
 			watcher.Watch(ctx, kvstore.Client(), WithSelfDeletionProtection())
 		}()
@@ -415,7 +416,17 @@ func (ipc *IPCache) InitIPIdentityWatcher(ctx context.Context, factory storepkg.
 }
 
 // WaitForKVStoreSync waits until the ipcache has been synchronized from the kvstore
-func WaitForKVStoreSync() {
-	<-initialized
-	watcher.waitForInitialSync()
+func WaitForKVStoreSync(ctx context.Context) error {
+	select {
+	case <-initialized:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	select {
+	case <-watcher.synced:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }

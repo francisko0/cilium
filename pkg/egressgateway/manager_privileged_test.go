@@ -13,11 +13,13 @@ import (
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/cilium/hive/hivetest"
 	"github.com/google/uuid"
+	"github.com/spf13/afero"
 	"github.com/stretchr/testify/require"
 	"github.com/vishvananda/netlink"
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/cilium/cilium/pkg/bpf"
+	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
 	"github.com/cilium/cilium/pkg/hive"
 	"github.com/cilium/cilium/pkg/identity"
 	cilium_api_v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
@@ -25,6 +27,7 @@ import (
 	slimv1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
 	k8sTypes "github.com/cilium/cilium/pkg/k8s/types"
 	"github.com/cilium/cilium/pkg/labels"
+	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/maps/egressmap"
 	"github.com/cilium/cilium/pkg/node/addressing"
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
@@ -48,6 +51,7 @@ const (
 	ep3IP = "10.0.0.3"
 
 	destCIDR        = "1.1.1.0/24"
+	destCIDR3       = "1.1.3.0/24"
 	allZeroDestCIDR = "0.0.0.0/0"
 	excludedCIDR1   = "1.1.1.22/32"
 	excludedCIDR2   = "1.1.1.240/30"
@@ -62,6 +66,9 @@ const (
 	// Special values for gatewayIP, see pkg/egressgateway/manager.go
 	gatewayNotFoundValue     = "0.0.0.0"
 	gatewayExcludedCIDRValue = "0.0.0.1"
+
+	// Special values for egressIP, see pkg/egressgateway/manager.go
+	egressIPNotFoundValue = "0.0.0.0"
 )
 
 var (
@@ -89,11 +96,17 @@ type parsedEgressRule struct {
 	gatewayIP netip.Addr
 }
 
+type rpFilterSetting struct {
+	iFaceName       string
+	rpFilterSetting string
+}
+
 type EgressGatewayTestSuite struct {
 	manager   *Manager
 	policies  fakeResource[*Policy]
 	nodes     fakeResource[*cilium_api_v2.CiliumNode]
 	endpoints fakeResource[*k8sTypes.CiliumEndpoint]
+	sysctl    sysctl.Sysctl
 }
 
 func setupEgressGatewayTestSuite(t *testing.T) *EgressGatewayTestSuite {
@@ -109,6 +122,7 @@ func setupEgressGatewayTestSuite(t *testing.T) *EgressGatewayTestSuite {
 	k.policies = make(fakeResource[*Policy])
 	k.nodes = make(fakeResource[*cilium_api_v2.CiliumNode])
 	k.endpoints = make(fakeResource[*k8sTypes.CiliumEndpoint])
+	k.sysctl = sysctl.NewDirectSysctl(afero.NewOsFs(), "/proc")
 
 	lc := hivetest.Lifecycle(t)
 	policyMap := egressmap.CreatePrivatePolicyMap(lc, egressmap.DefaultPolicyConfig)
@@ -116,12 +130,13 @@ func setupEgressGatewayTestSuite(t *testing.T) *EgressGatewayTestSuite {
 	k.manager, err = newEgressGatewayManager(Params{
 		Lifecycle:         lc,
 		Config:            Config{1 * time.Millisecond},
-		DaemonConfig:      &option.DaemonConfig{},
+		DaemonConfig:      &option.DaemonConfig{ConfigPatchMutex: new(lock.RWMutex)},
 		IdentityAllocator: identityAllocator,
 		PolicyMap:         policyMap,
 		Policies:          k.policies,
 		Nodes:             k.nodes,
 		Endpoints:         k.endpoints,
+		Sysctl:            k.sysctl,
 	})
 	require.NoError(t, err)
 	require.NotNil(t, k.manager)
@@ -203,8 +218,8 @@ func TestEgressGatewayCEGPParser(t *testing.T) {
 
 func TestEgressGatewayManager(t *testing.T) {
 	k := setupEgressGatewayTestSuite(t)
-	createTestInterface(t, testInterface1, egressCIDR1)
-	createTestInterface(t, testInterface2, egressCIDR2)
+	createTestInterface(t, k.sysctl, testInterface1, egressCIDR1)
+	createTestInterface(t, k.sysctl, testInterface2, egressCIDR2)
 
 	policyMap := k.manager.policyMap
 	egressGatewayManager := k.manager
@@ -242,6 +257,10 @@ func TestEgressGatewayManager(t *testing.T) {
 	addPolicy(t, k.policies, &policy1)
 	reconciliationEventsCount = waitForReconciliationRun(t, egressGatewayManager, reconciliationEventsCount)
 
+	assertRPFilter(t, k.sysctl, []rpFilterSetting{
+		{iFaceName: testInterface1, rpFilterSetting: "2"},
+		{iFaceName: testInterface2, rpFilterSetting: "1"},
+	})
 	assertEgressRules(t, policyMap, []egressRule{})
 
 	// Add a new endpoint & ID which matches policy-1
@@ -390,6 +409,22 @@ func TestEgressGatewayManager(t *testing.T) {
 		{ep2IP, destCIDR, zeroIP4, node2IP},
 	})
 
+	// Test a policy without valid egressIP
+	addPolicy(t, k.policies, &policyParams{
+		name:            "policy-3",
+		endpointLabels:  ep1Labels,
+		destinationCIDR: destCIDR3,
+		nodeLabels:      nodeGroup1Labels,
+		iface:           "no_interface",
+	})
+	reconciliationEventsCount = waitForReconciliationRun(t, egressGatewayManager, reconciliationEventsCount)
+
+	assertEgressRules(t, policyMap, []egressRule{
+		{ep1IP, destCIDR, zeroIP4, gatewayNotFoundValue},
+		{ep1IP, destCIDR3, egressIPNotFoundValue, node1IP},
+		{ep2IP, destCIDR, zeroIP4, node2IP},
+	})
+
 	// Update the endpoint labels in order for it to not be a match
 	_ = updateEndpointAndIdentity(&ep1, id1, map[string]string{})
 	addEndpoint(t, k.endpoints, &ep1)
@@ -403,7 +438,7 @@ func TestEgressGatewayManager(t *testing.T) {
 func TestEndpointDataStore(t *testing.T) {
 	k := setupEgressGatewayTestSuite(t)
 
-	createTestInterface(t, testInterface1, egressCIDR1)
+	createTestInterface(t, k.sysctl, testInterface1, egressCIDR1)
 
 	policyMap := k.manager.policyMap
 	egressGatewayManager := k.manager
@@ -481,7 +516,7 @@ func TestCell(t *testing.T) {
 	}
 }
 
-func createTestInterface(tb testing.TB, iface string, addr string) {
+func createTestInterface(tb testing.TB, sysctl sysctl.Sysctl, iface string, addr string) {
 	tb.Helper()
 
 	la := netlink.NewLinkAttrs()
@@ -510,6 +545,28 @@ func createTestInterface(tb testing.TB, iface string, addr string) {
 	if err := netlink.AddrAdd(link, a); err != nil {
 		tb.Fatal(err)
 	}
+
+	ensureRPFilterIsEnabled(tb, sysctl, iface)
+}
+
+func ensureRPFilterIsEnabled(tb testing.TB, sysctl sysctl.Sysctl, iface string) {
+	rpFilterSetting := []string{"net", "ipv4", "conf", iface, "rp_filter"}
+
+	for i := 0; i < 10; i++ {
+		if err := sysctl.Enable(rpFilterSetting); err != nil {
+			tb.Fatal(err)
+		}
+
+		time.Sleep(100 * time.Millisecond)
+
+		if val, err := sysctl.Read(rpFilterSetting); err == nil {
+			if val == "1" {
+				return
+			}
+		}
+	}
+
+	tb.Fatal("failed to enable rp_filter")
 }
 
 func waitForReconciliationRun(tb testing.TB, egressGatewayManager *Manager, currentRun uint64) uint64 {
@@ -627,6 +684,25 @@ func tryAssertEgressRules(policyMap egressmap.PolicyMap, rules []egressRule) err
 
 	if untrackedRule {
 		return fmt.Errorf("Untracked egress policy")
+	}
+
+	return nil
+}
+
+func assertRPFilter(t *testing.T, sysctl sysctl.Sysctl, rpFilterSettings []rpFilterSetting) {
+	t.Helper()
+
+	err := tryAssertRPFilterSettings(sysctl, rpFilterSettings)
+	require.NoError(t, err)
+}
+
+func tryAssertRPFilterSettings(sysctl sysctl.Sysctl, rpFilterSettings []rpFilterSetting) error {
+	for _, setting := range rpFilterSettings {
+		if val, err := sysctl.Read([]string{"net", "ipv4", "conf", setting.iFaceName, "rp_filter"}); err != nil {
+			return fmt.Errorf("failed to read rp_filter")
+		} else if val != setting.rpFilterSetting {
+			return fmt.Errorf("mismatched rp_filter iface: %s rp_filter: %s", setting.iFaceName, val)
+		}
 	}
 
 	return nil

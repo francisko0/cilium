@@ -552,7 +552,7 @@ func (e *Endpoint) ProcessChangeRequest(newEp *Endpoint, validPatchTransitionSta
 	rev := e.replaceIdentityLabels(labels.LabelSourceAny, newEp.OpLabels.IdentityLabels())
 	if rev != 0 {
 		// Run as a goroutine since the runIdentityResolver needs to get the lock
-		go e.runIdentityResolver(e.aliveCtx, rev, false)
+		go e.runIdentityResolver(e.aliveCtx, false)
 	}
 
 	// If desired state is waiting-for-identity but identity is already
@@ -582,8 +582,8 @@ func (e *Endpoint) ProcessChangeRequest(newEp *Endpoint, validPatchTransitionSta
 		default:
 			// Caller skips regeneration if reason == "". Bump the skipped regeneration level so that next
 			// regeneration will realise endpoint changes.
-			if e.skippedRegenerationLevel < regeneration.RegenerateWithDatapathRewrite {
-				e.skippedRegenerationLevel = regeneration.RegenerateWithDatapathRewrite
+			if e.skippedRegenerationLevel < regeneration.RegenerateWithDatapath {
+				e.skippedRegenerationLevel = regeneration.RegenerateWithDatapath
 			}
 		}
 	}

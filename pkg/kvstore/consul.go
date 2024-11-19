@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	consulAPI "github.com/hashicorp/consul/api"
 	"github.com/sirupsen/logrus"
@@ -121,7 +122,7 @@ func (c *consulModule) getConfig() map[string]string {
 
 func (c *consulModule) newClient(ctx context.Context, opts *ExtraOptions) (BackendOperations, chan error) {
 	log.WithFields(logrus.Fields{
-		logfields.URL: "https://cilium.herokuapp.com/",
+		logfields.URL: "https://slack.cilium.io",
 	}).Warning("Support for Consul as a kvstore backend has been deprecated due to lack of maintainers. If you are interested in helping to maintain Consul support in Cilium, please reach out on GitHub or the official Cilium slack")
 
 	errChan := make(chan error, 1)
@@ -305,6 +306,7 @@ func (c *consulClient) LockPath(ctx context.Context, path string) (KVLocker, err
 
 // watch starts watching for changes in a prefix
 func (c *consulClient) watch(ctx context.Context, w *Watcher) {
+	scope := GetScopeFromKey(strings.TrimRight(w.Prefix, "/"))
 	// Last known state of all KVPairs matching the prefix
 	localState := map[string]consulAPI.KVPair{}
 	nextIndex := uint64(0)
@@ -355,7 +357,7 @@ func (c *consulClient) watch(ctx context.Context, w *Watcher) {
 					Key:   newPair.Key,
 					Value: newPair.Value,
 				}
-				trackEventQueued(newPair.Key, EventTypeCreate, queueStart.End(true).Total())
+				trackEventQueued(scope, EventTypeCreate, queueStart.End(true).Total())
 			} else if oldPair.ModifyIndex != newPair.ModifyIndex {
 				queueStart := spanstat.Start()
 				w.Events <- KeyValueEvent{
@@ -363,7 +365,7 @@ func (c *consulClient) watch(ctx context.Context, w *Watcher) {
 					Key:   newPair.Key,
 					Value: newPair.Value,
 				}
-				trackEventQueued(newPair.Key, EventTypeModify, queueStart.End(true).Total())
+				trackEventQueued(scope, EventTypeModify, queueStart.End(true).Total())
 			}
 
 			// Everything left on localState will be assumed to
@@ -379,7 +381,7 @@ func (c *consulClient) watch(ctx context.Context, w *Watcher) {
 				Key:   deletedPair.Key,
 				Value: deletedPair.Value,
 			}
-			trackEventQueued(deletedPair.Key, EventTypeDelete, queueStart.End(true).Total())
+			trackEventQueued(scope, EventTypeDelete, queueStart.End(true).Total())
 			delete(localState, k)
 		}
 
@@ -647,7 +649,7 @@ func (c *consulClient) listPrefix(ctx context.Context, prefix string) (KeyValueP
 }
 
 // Close closes the consul session
-func (c *consulClient) Close(ctx context.Context) {
+func (c *consulClient) Close() {
 	close(c.statusCheckErrors)
 	if c.controllers != nil {
 		c.controllers.RemoveAll()

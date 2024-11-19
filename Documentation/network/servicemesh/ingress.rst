@@ -61,8 +61,50 @@ Prerequisites
 
 .. include:: installation.rst
 
+.. include:: ingress-reference.rst
+
+
+Ingress Path Types and Precedence
+*********************************
+
+The Ingress specification supports three types of paths:
+
+* **Exact** - match the given path exactly.
+* **Prefix** - match the URL path prefix split by ``/``. The last path segment must
+  match the whole segment - if you configure a Prefix path of ``/foo/bar``,
+  ``/foo/bar/baz`` will match, but ``/foo/barbaz`` will not.
+* **ImplementationSpecific** - Interpretation of the Path is up to the IngressClass.
+  **In Cilium's case, we define ImplementationSpecific to be "Regex"**, so Cilium will
+  interpret any given path as a regular expression and program Envoy accordingly.
+  Notably, some other implementations have ImplementationSpecific mean "Prefix",
+  and in those cases, Cilium will treat the paths differently. (Since a path like
+  ``/foo/bar`` contains no regex characters, when it is configured in Envoy as a
+  regex, it will function as an ``Exact`` match instead).
+
+When multiple path types are configured on an Ingress object, Cilium will configure
+Envoy with the matches in the following order:
+
+#. Exact
+#. ImplementationSpecific (that is, regular expression)
+#. Prefix
+#. The ``/`` Prefix match has special handling and always goes last.
+
+Within each of these path types, the paths are sorted in decreasing order of string
+length.
+
+If you do use ImplementationSpecific regex support, be careful with using the
+``*`` operator, since it will increase the length of the regex, but may match
+another, shorter option.
+
+For example, if you have two ImplementationSpecific paths, ``/impl``, and ``/impl.*``,
+the second will be sorted ahead of the first in the generated config. But because
+``*`` is in use, the ``/impl`` match will never be hit, as any request to that
+path will match the ``/impl.*`` path first.
+
+See the :ref:`Ingress Path Types <gs_ingress_path_types>` for more information.
+
 Supported Ingress Annotations
-#############################
+*****************************
 
 .. list-table::
    :header-rows: 1
@@ -79,11 +121,20 @@ Supported Ingress Annotations
        | ``shared``.
      - | ``dedicated``
        | (from Helm chart)
+   * - ``ingress.cilium.io/loadbalancer-class``
+     - | The loadbalancer class for the ingress.
+       | Only applicable when ``loadbalancer-mode`` is set to ``dedicated``.
+     - unspecified
    * - ``ingress.cilium.io/service-type``
      - | The Service type for dedicated Ingress.
        | Applicable values are ``LoadBalancer``
        | and ``NodePort``.
      - ``LoadBalancer``
+   * - ``ingress.cilium.io/service-external-traffic-policy``
+     - | The Service externalTrafficPolicy for dedicated
+       | Ingress. Applicable values are ``Cluster``
+       | and ``Local``.
+     - ``Cluster``
    * - ``ingress.cilium.io/insecure-node-port``
      - | The NodePort to use for the HTTP Ingress.
        | Applicable only if ``ingress.cilium.io/service-type``
@@ -283,6 +334,8 @@ Cilium's Ingress features:
    :glob:
 
    http
+   ingress-and-network-policy
+   path-types   
    grpc
    tls-termination
    tls-default-certificate

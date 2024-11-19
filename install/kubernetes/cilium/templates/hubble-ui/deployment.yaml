@@ -40,10 +40,8 @@ spec:
         {{- end }}
     spec:
       {{- with .Values.hubble.ui.securityContext }}
-        {{- if .enabled }}
       securityContext:
         {{- omit . "enabled" | toYaml | nindent 8 }}
-        {{- end}}
       {{- end }}
       priorityClassName: {{ .Values.hubble.ui.priorityClassName }}
       serviceAccountName: {{ .Values.serviceAccounts.ui.name | quote }}
@@ -188,7 +186,7 @@ spec:
           defaultMode: 0400
           sources:
           - secret:
-              name: hubble-ui-client-certs
+              name: {{ .Values.hubble.ui.tls.client.existingSecret | default "hubble-ui-client-certs" }}
               items:
                 - key: tls.crt
                   path: client.crt

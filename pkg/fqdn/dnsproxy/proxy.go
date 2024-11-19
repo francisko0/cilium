@@ -121,7 +121,7 @@ type DNSProxy struct {
 	lock.RWMutex
 
 	// DNSClients is a container for dns.SharedClient instances.
-	DNSClients *dns.SharedClients
+	DNSClients *SharedClients
 
 	// usedServers is the set of DNS servers that have been allowed and used successfully.
 	// This is used to limit the number of IPs we store for restored DNS rules.
@@ -615,6 +615,18 @@ func (proxyStat *ProxyRequestContext) IsTimeout() bool {
 	return false
 }
 
+// DNSProxyConfig is the configuration for the DNS proxy.
+type DNSProxyConfig struct {
+	Address                string
+	Port                   uint16
+	IPv4                   bool
+	IPv6                   bool
+	EnableDNSCompression   bool
+	MaxRestoreDNSIPs       int
+	ConcurrencyLimit       int
+	ConcurrencyGracePeriod time.Duration
+}
+
 // StartDNSProxy starts a proxy used for DNS L7 redirects that listens on
 // address and port on IPv4 and/or IPv6 depending on the values of ipv4/ipv6.
 // address is the bind address to listen on. Empty binds to all local
@@ -627,17 +639,13 @@ func (proxyStat *ProxyRequestContext) IsTimeout() bool {
 // requesting endpoint. Note that denied requests will not trigger this
 // callback.
 func StartDNSProxy(
-	address string, port uint16,
-	ipv4 bool, ipv6 bool,
-	enableDNSCompression bool,
-	maxRestoreDNSIPs int,
+	dnsProxyConfig DNSProxyConfig,
 	lookupEPFunc LookupEndpointIDByIPFunc,
 	lookupSecIDFunc LookupSecIDByIPFunc,
 	lookupIPsFunc LookupIPsBySecIDFunc,
 	notifyFunc NotifyOnDNSMsgFunc,
-	concurrencyLimit int, concurrencyGracePeriod time.Duration,
 ) (*DNSProxy, error) {
-	if port == 0 {
+	if dnsProxyConfig.Port == 0 {
 		log.Debug("DNS Proxy port is configured to 0. A random port will be assigned by the OS.")
 	}
 
@@ -657,13 +665,13 @@ func StartDNSProxy(
 		restored:                 make(perEPRestored),
 		restoredEPs:              make(restoredEPs),
 		cache:                    make(regexCache),
-		EnableDNSCompression:     enableDNSCompression,
-		maxIPsPerRestoredDNSRule: maxRestoreDNSIPs,
-		DNSClients:               dns.NewSharedClients(),
+		EnableDNSCompression:     dnsProxyConfig.EnableDNSCompression,
+		maxIPsPerRestoredDNSRule: dnsProxyConfig.MaxRestoreDNSIPs,
+		DNSClients:               NewSharedClients(),
 	}
-	if concurrencyLimit > 0 {
-		p.ConcurrencyLimit = semaphore.NewWeighted(int64(concurrencyLimit))
-		p.ConcurrencyGracePeriod = concurrencyGracePeriod
+	if dnsProxyConfig.ConcurrencyLimit > 0 {
+		p.ConcurrencyLimit = semaphore.NewWeighted(int64(dnsProxyConfig.ConcurrencyLimit))
+		p.ConcurrencyGracePeriod = dnsProxyConfig.ConcurrencyGracePeriod
 	}
 	p.rejectReply.Store(dns.RcodeRefused)
 
@@ -676,7 +684,7 @@ func StartDNSProxy(
 
 	start := time.Now()
 	for time.Since(start) < ProxyBindTimeout {
-		dnsServers, bindPort, err = bindToAddr(address, port, p, ipv4, ipv6)
+		dnsServers, bindPort, err = bindToAddr(dnsProxyConfig.Address, dnsProxyConfig.Port, p, dnsProxyConfig.IPv4, dnsProxyConfig.IPv6, p.DNSClients)
 		if err == nil {
 			break
 		}
@@ -835,8 +843,8 @@ func (p *DNSProxy) CheckAllowed(endpointID uint64, destPortProto restore.PortPro
 func setSoMarks(fd int, ipFamily ipfamily.IPFamily, secId identity.NumericIdentity) error {
 	// Set SO_MARK to allow datapath to know these upstream packets from an egress proxy
 	mark := linux_defaults.MagicMarkEgress
-	mark |= int(uint32(secId&0xFFFF)<<16 | uint32((secId&0xFF0000)>>16))
-	err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_MARK, mark)
+	mark |= uint32(secId&0xFFFF)<<16 | uint32((secId&0xFF0000)>>16)
+	err := unix.SetsockoptUint64(fd, unix.SOL_SOCKET, unix.SO_MARK, uint64(mark))
 	if err != nil {
 		return fmt.Errorf("error setting SO_MARK: %w", err)
 	}
@@ -873,6 +881,23 @@ func setSoMarks(fd int, ipFamily ipfamily.IPFamily, secId identity.NumericIdenti
 		}
 	}
 
+	// Set SO_LINGER to ensure the TCP socket is closed and ready to be re-used in case
+	// the client reuses the same source port in short succession (this is e.g. the case
+	// with glibc). If SO_LINGER is not used, the old socket might have not yet reached
+	// the TIME_WAIT state by the time we are trying to reuse the port on a new socket.
+	// If that happens, the connect() call will fail with EADDRNOTAVAIL.
+	// Note that the linger timeout can also be set to 0, in which case the socket is
+	// terminated forcefully with a TCP RST and thus can also be reused immediately.
+	if linger := option.Config.DNSProxySocketLingerTimeout; linger >= 0 {
+		err = unix.SetsockoptLinger(fd, unix.SOL_SOCKET, unix.SO_LINGER, &unix.Linger{
+			Onoff:  1,
+			Linger: int32(linger),
+		})
+		if err != nil {
+			return fmt.Errorf("setsockopt(SO_LINGER) failed: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -890,7 +915,7 @@ func setSoMarks(fd int, ipFamily ipfamily.IPFamily, secId identity.NumericIdenti
 func (p *DNSProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 	stat := ProxyRequestContext{DataSource: accesslog.DNSSourceProxy}
 	stat.TotalTime.Start()
-	requestID := request.Id // keep the original request ID
+	requestID := request.Id // save the original request ID
 	qname := string(request.Question[0].Name)
 	protocol := w.LocalAddr().Network()
 	epIPPort := w.RemoteAddr().String()
@@ -1046,7 +1071,7 @@ func (p *DNSProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 	// - is the local host
 	if option.Config.DNSProxyEnableTransparentMode && !ep.IsHost() && !epAddr.IsLoopback() && ep.ID != uint16(identity.ReservedIdentityHost) && targetServerID.IsCluster() && targetServerID != identity.ReservedIdentityHost {
 		dialer.LocalAddr = w.RemoteAddr()
-		key = protocol + "-" + epIPPort + "-" + targetServerAddrStr
+		key = sharedClientKey(protocol, epIPPort, targetServerAddrStr)
 	}
 
 	conf := &dns.Client{
@@ -1056,7 +1081,6 @@ func (p *DNSProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 		SingleInflight: false,
 	}
 
-	request.Id = dns.Id() // force a random new ID for this request
 	response, _, closer, err := p.DNSClients.Exchange(key, conf, request, targetServerAddrStr)
 	defer closer()
 
@@ -1082,7 +1106,7 @@ func (p *DNSProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 	p.NotifyOnDNSMsg(time.Now(), ep, epIPPort, targetServerID, targetServerAddrStr, response, protocol, true, &stat)
 
 	scopedLog.Debug("Responding to original DNS query")
-	// restore the ID to the one in the initial request so it matches what the requester expects.
+	// Ensure the ID matches the initial request - the upstream query may have changed the ID to avoid duplicates.
 	response.Id = requestID
 	response.Compress = p.EnableDNSCompression && shouldCompressResponse(request, response)
 	err = w.WriteMsg(response)
@@ -1214,7 +1238,7 @@ func ExtractMsgDetails(msg *dns.Msg) (qname string, responseIPs []net.IP, TTL ui
 // Note: This mimics what the dns package does EXCEPT for setting reuseport.
 // This is ok for now but it would simplify proxy management in the future to
 // have it set.
-func bindToAddr(address string, port uint16, handler dns.Handler, ipv4, ipv6 bool) (dnsServers []*dns.Server, bindPort uint16, err error) {
+func bindToAddr(address string, port uint16, handler dns.Handler, ipv4, ipv6 bool, sc *SharedClients) (dnsServers []*dns.Server, bindPort uint16, err error) {
 	defer func() {
 		if err != nil {
 			shutdownServers(dnsServers)
@@ -1236,6 +1260,10 @@ func bindToAddr(address string, port uint16, handler dns.Handler, ipv4, ipv6 boo
 		if err != nil {
 			return nil, 0, fmt.Errorf("failed to listen on %s: %w", ipFamily.TCPAddress, err)
 		}
+		if option.Config.DNSProxyEnableTransparentMode {
+			// The wrapper is only necessary to forward the closing signal in transparent mode.
+			tcpListener = &wrappedTCPListener{sc: sc, Listener: tcpListener}
+		}
 		dnsServers = append(dnsServers, &dns.Server{
 			Listener: tcpListener, Handler: handler,
 			// Explicitly set a noop factory to prevent data race detection when InitPool is called
@@ -1251,8 +1279,8 @@ func bindToAddr(address string, port uint16, handler dns.Handler, ipv4, ipv6 boo
 		if err != nil {
 			return nil, 0, fmt.Errorf("failed to listen on %s: %w", ipFamily.UDPAddress, err)
 		}
-		sessionUDPFactory, ferr := NewSessionUDPFactory(ipFamily)
-		if ferr != nil {
+		sessionUDPFactory, err := NewSessionUDPFactory(ipFamily)
+		if err != nil {
 			return nil, 0, fmt.Errorf("failed to create UDP session factory for %s: %w", ipFamily.UDPAddress, err)
 		}
 		dnsServers = append(dnsServers, &dns.Server{
@@ -1263,6 +1291,56 @@ func bindToAddr(address string, port uint16, handler dns.Handler, ipv4, ipv6 boo
 	}
 
 	return dnsServers, bindPort, nil
+}
+
+type wrappedTCPListener struct {
+	net.Listener
+	sc *SharedClients
+}
+
+func (w *wrappedTCPListener) Accept() (net.Conn, error) {
+	c, err := w.Listener.Accept()
+	if err != nil {
+		return c, err
+	}
+
+	wc := &wrappedTCPConn{c.(*net.TCPConn), w.sc}
+	return wc, err
+}
+
+type wrappedTCPConn struct {
+	*net.TCPConn
+	sc *SharedClients
+}
+
+func (w *wrappedTCPConn) key() string {
+	return sharedClientKey("tcp", w.RemoteAddr().String(), w.LocalAddr().String())
+}
+
+func (w *wrappedTCPConn) Read(b []byte) (int, error) {
+	n, err := w.TCPConn.Read(b)
+	if err != nil {
+		// Any error is reason enough to close the upstream conn.
+		w.sc.ShutdownTCPClient(w.key())
+	}
+	return n, err
+}
+func (w *wrappedTCPConn) Write(b []byte) (int, error) {
+	n, err := w.TCPConn.Write(b)
+	if err != nil {
+		w.sc.ShutdownTCPClient(w.key())
+	}
+	return n, err
+}
+
+// Close closes the wrapped connection, but also forwards the closing signal to
+// shared clients, so that the upstream connection is closed too.
+func (w *wrappedTCPConn) Close() error {
+	// It's possible that there is no shared client behind this key, as we don't
+	// always use the original source address. That's okay, since ShutdownClient
+	// does nothing for keys it doesn't know.
+	w.sc.ShutdownTCPClient(w.key())
+	return w.TCPConn.Close()
 }
 
 func evaluateAddress(address string, port uint16, bindPort uint16, ipFamily ipfamily.IPFamily) string {

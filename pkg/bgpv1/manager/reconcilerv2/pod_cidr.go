@@ -14,8 +14,6 @@ import (
 	"github.com/cilium/cilium/pkg/bgpv1/manager/instance"
 	"github.com/cilium/cilium/pkg/bgpv1/types"
 	"github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
-	"github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/labels"
-	slim_metav1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
 	"github.com/cilium/cilium/pkg/option"
 )
 
@@ -66,6 +64,12 @@ func (r *PodCIDRReconciler) Priority() int {
 	return 30
 }
 
+func (r *PodCIDRReconciler) Init(_ *instance.BGPInstance) error {
+	return nil
+}
+
+func (r *PodCIDRReconciler) Cleanup(_ *instance.BGPInstance) {}
+
 func (r *PodCIDRReconciler) Reconcile(ctx context.Context, p ReconcileParams) error {
 	if p.DesiredConfig == nil {
 		return fmt.Errorf("BUG: PodCIDR reconciler called with nil CiliumBGPNodeConfig")
@@ -112,7 +116,7 @@ func (r *PodCIDRReconciler) reconcilePaths(ctx context.Context, p ReconcileParam
 	updatedAFPaths, err := ReconcileAFPaths(&ReconcileAFPathsParams{
 		Logger:       r.logger.WithField(types.InstanceLogField, p.DesiredConfig.Name),
 		Ctx:          ctx,
-		Instance:     p.BGPInstance,
+		Router:       p.BGPInstance.Router,
 		DesiredPaths: desiredFamilyAdverts,
 		CurrentPaths: metadata.AFPaths,
 	})
@@ -135,7 +139,7 @@ func (r *PodCIDRReconciler) reconcileRoutePolicies(ctx context.Context, p Reconc
 	updatedPolicies, err := ReconcileRoutePolicies(&ReconcileRoutePoliciesParams{
 		Logger:          r.logger.WithField(types.InstanceLogField, p.DesiredConfig.Name),
 		Ctx:             ctx,
-		Instance:        p.BGPInstance,
+		Router:          p.BGPInstance.Router,
 		DesiredPolicies: desiredRoutePolicies,
 		CurrentPolicies: r.getMetadata(p.BGPInstance).RoutePolicies,
 	})
@@ -194,17 +198,6 @@ func (r *PodCIDRReconciler) getDesiredRoutePolicies(p ReconcileParams, desiredPe
 			fam := types.ToAgentFamily(family)
 
 			for _, advert := range adverts {
-				labelSelector, err := slim_metav1.LabelSelectorAsSelector(advert.Selector)
-				if err != nil {
-					return nil, fmt.Errorf("failed constructing LabelSelector: %w", err)
-				}
-
-				// if there is a label selector in advertisement, check if it matches cilium node label.
-				// No selector means it matches the node.
-				if advert.Selector != nil && !labelSelector.Matches(labels.Set(p.CiliumNode.Labels)) {
-					continue
-				}
-
 				var v4Prefixes, v6Prefixes types.PolicyPrefixMatchList
 				for _, prefix := range desiredPrefixes {
 					match := &types.RoutePolicyPrefixMatch{CIDR: prefix, PrefixLenMin: prefix.Bits(), PrefixLenMax: prefix.Bits()}
@@ -219,7 +212,7 @@ func (r *PodCIDRReconciler) getDesiredRoutePolicies(p ReconcileParams, desiredPe
 				}
 
 				if len(v6Prefixes) > 0 || len(v4Prefixes) > 0 {
-					name := PolicyName(peer, fam.Afi.String(), string(advert.AdvertisementType))
+					name := PolicyName(peer, fam.Afi.String(), advert.AdvertisementType, "")
 					policy, err := CreatePolicy(name, peerAddr, v4Prefixes, v6Prefixes, advert)
 					if err != nil {
 						return nil, err

@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"path"
 	"sync"
 	"testing"
@@ -15,6 +14,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 	etcdAPI "go.etcd.io/etcd/client/v3"
+	"golang.org/x/exp/maps"
+	"k8s.io/apimachinery/pkg/util/rand"
 
 	"github.com/cilium/cilium/pkg/testutils"
 )
@@ -40,161 +41,6 @@ func TestHint(t *testing.T) {
 	err = ctx.Err()
 
 	require.ErrorContains(t, Hint(err), "etcd client timeout exceeded")
-}
-
-func TestIsEtcdOperator(t *testing.T) {
-	temp := t.TempDir()
-	etcdConfigByte := []byte(`---
-endpoints:
-- https://cilium-etcd-client.kube-system.svc:2379
-`)
-	etcdTempFile := path.Join(temp, "etcd-config.yaml")
-	err := os.WriteFile(etcdTempFile, etcdConfigByte, 0600)
-	require.NoError(t, err)
-	type args struct {
-		backend      string
-		opts         map[string]string
-		k8sNamespace string
-	}
-	tests := []struct {
-		args        args
-		wantSvcName string
-		wantBool    bool
-	}{
-		{
-			args: args{
-				backend: consulName,
-			},
-			// it is not etcd
-			wantBool: false,
-		},
-		{
-			args: args{
-				backend: EtcdBackendName,
-			},
-			// misses configuration
-			wantBool: false,
-		},
-		{
-			args: args{
-				backend: EtcdBackendName,
-				opts: map[string]string{
-					"etcd.address": "http://cilium-etcd-client.kube-system.svc",
-				},
-				k8sNamespace: "kube-system",
-			},
-			wantSvcName: "http://cilium-etcd-client.kube-system.svc",
-			// everything valid
-			wantBool: true,
-		},
-		{
-			args: args{
-				backend: EtcdBackendName,
-				opts: map[string]string{
-					"etcd.address": "cilium-etcd-client.kube-system.svc",
-				},
-				k8sNamespace: "kube-system",
-			},
-			// domain name misses protocol
-			wantBool: false,
-		},
-		{
-			args: args{
-				opts: map[string]string{
-					"etcd.address": "cilium-etcd-client.kube-system.svc",
-				},
-				k8sNamespace: "kube-system",
-			},
-			// backend not specified
-			wantBool: false,
-		},
-		{
-			args: args{
-				backend: EtcdBackendName,
-				opts: map[string]string{
-					"etcd.config": etcdTempFile,
-				},
-				k8sNamespace: "kube-system",
-			},
-			wantSvcName: "https://cilium-etcd-client.kube-system.svc:2379",
-			// config file with everything setup
-			wantBool: true,
-		},
-		{
-			args: args{
-				backend: EtcdBackendName,
-				opts: map[string]string{
-					"etcd.address":  "foo-bar.kube-system.svc",
-					"etcd.operator": "true",
-				},
-				k8sNamespace: "kube-system",
-			},
-			wantSvcName: "foo-bar.kube-system.svc",
-			wantBool:    true,
-		},
-		{
-			args: args{
-				backend: EtcdBackendName,
-				opts: map[string]string{
-					"etcd.address":  "foo-bar.kube-system.svc",
-					"etcd.operator": "false",
-				},
-				k8sNamespace: "kube-system",
-			},
-			wantBool: false,
-		},
-		{
-			args: args{
-				backend: EtcdBackendName,
-				opts: map[string]string{
-					"etcd.address": "foo-bar.kube-system.svc",
-				},
-				k8sNamespace: "kube-system",
-			},
-			wantBool: false,
-		},
-		{
-			args: args{
-				backend: EtcdBackendName,
-				opts: map[string]string{
-					"etcd.address":  "foo-bar.kube-system.svc",
-					"etcd.operator": "foo-bar",
-				},
-				k8sNamespace: "kube-system",
-			},
-			wantBool: false,
-		},
-		{
-			args: args{
-				backend: EtcdBackendName,
-				opts: map[string]string{
-					"etcd.address":  "https://cilium-etcd-client.kube-system.svc",
-					"etcd.operator": "foo-bar",
-				},
-				k8sNamespace: "kube-system",
-			},
-			wantSvcName: "https://cilium-etcd-client.kube-system.svc",
-			wantBool:    true,
-		},
-		{
-			args: args{
-				backend: EtcdBackendName,
-				opts: map[string]string{
-					"etcd.config":   etcdTempFile,
-					"etcd.operator": "foo-bar",
-				},
-				k8sNamespace: "kube-system",
-			},
-			wantSvcName: "https://cilium-etcd-client.kube-system.svc:2379",
-			// config file with everything setup
-			wantBool: true,
-		},
-	}
-	for i, tt := range tests {
-		gotSvcName, gotBool := IsEtcdOperator(tt.args.backend, tt.args.opts, tt.args.k8sNamespace)
-		require.Equal(t, tt.wantBool, gotBool, "Test %d", i)
-		require.Equal(t, tt.wantSvcName, gotSvcName, "Test %d", i)
-	}
 }
 
 func setupEtcdLockedSuite(tb testing.TB) *etcdAPI.Client {
@@ -1325,75 +1171,6 @@ func TestListPrefixIfLocked(t *testing.T) {
 	}
 }
 
-func TestGetSvcNamespace(t *testing.T) {
-	type args struct {
-		address string
-	}
-	tests := []struct {
-		name          string
-		args          args
-		wantSvcName   string
-		wantNamespace string
-		wantErr       bool
-	}{
-		{
-			name: "test-1",
-			args: args{
-				address: "http://foo.bar.something",
-			},
-			wantSvcName:   "foo",
-			wantNamespace: "bar",
-			wantErr:       false,
-		},
-		{
-			name: "test-2",
-			args: args{
-				address: "http://foo.bar",
-			},
-			wantSvcName:   "foo",
-			wantNamespace: "bar",
-			wantErr:       false,
-		},
-		{
-			name: "test-3",
-			args: args{
-				address: "http://foo",
-			},
-			wantErr: true,
-		},
-		{
-			name: "test-4",
-			args: args{
-				address: "http://foo.bar:5679/",
-			},
-			wantSvcName:   "foo",
-			wantNamespace: "bar",
-			wantErr:       false,
-		},
-		{
-			name: "test-5",
-			args: args{
-				address: "http://foo:2379",
-			},
-			wantErr: true,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, got1, err := SplitK8sServiceURL(tt.args.address)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("SplitK8sServiceURL() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if got != tt.wantSvcName {
-				t.Errorf("SplitK8sServiceURL() got = %v, want %v", got, tt.wantSvcName)
-			}
-			if got1 != tt.wantNamespace {
-				t.Errorf("SplitK8sServiceURL() got1 = %v, want %v", got1, tt.wantNamespace)
-			}
-		})
-	}
-}
 func TestShuffleEndpoints(t *testing.T) {
 	s1 := []string{"1", "2", "3", "4", "5"}
 	s2 := make([]string, len(s1))
@@ -1633,6 +1410,20 @@ func testEtcdRateLimiter(t *testing.T, qps, count int, cmp func(require.TestingT
 	}
 }
 
+type kvWrapper struct {
+	etcdAPI.KV
+	postGet func(context.Context) error
+}
+
+func (kvw *kvWrapper) Get(ctx context.Context, key string, opts ...etcdAPI.OpOption) (*etcdAPI.GetResponse, error) {
+	res, err := kvw.KV.Get(ctx, key, opts...)
+	if err != nil {
+		return res, err
+	}
+
+	return res, kvw.postGet(ctx)
+}
+
 func TestPaginatedList(t *testing.T) {
 	testutils.IntegrationTest(t)
 	SetupDummyWithConfigOpts(t, "etcd", opts("etcd"))
@@ -1640,7 +1431,8 @@ func TestPaginatedList(t *testing.T) {
 	const prefix = "list/paginated"
 	ctx := context.Background()
 
-	run := func(batch int) {
+	run := func(t *testing.T, batch int, withParallelOps bool) {
+		cl := Client().(*etcdClient)
 		keys := map[string]struct{}{
 			path.Join(prefix, "immortal-finch"):   {},
 			path.Join(prefix, "rare-goshawk"):     {},
@@ -1655,19 +1447,45 @@ func TestPaginatedList(t *testing.T) {
 		}
 
 		defer func(previous int) {
-			Client().(*etcdClient).listBatchSize = previous
-			require.Nil(t, Client().DeletePrefix(ctx, prefix))
-		}(Client().(*etcdClient).listBatchSize)
-		Client().(*etcdClient).listBatchSize = batch
+			cl.listBatchSize = previous
+			require.Nil(t, cl.DeletePrefix(ctx, prefix))
+		}(cl.listBatchSize)
+		cl.listBatchSize = batch
+
+		var next int64
+		if withParallelOps {
+			pkv := cl.client.KV
+			defer func() { cl.client.KV = pkv }()
+
+			cl.client.KV = &kvWrapper{
+				KV: pkv,
+				// paginatedList should observe neither upsertions nor deletions
+				// performed after that the initial chunk of entries was retrieved.
+				postGet: func(ctx context.Context) error {
+					key := path.Join(prefix, rand.String(10))
+					res, err := cl.client.Put(ctx, key, "value")
+					if err != nil {
+						return err
+					}
+
+					if next == 0 {
+						next = res.Header.Revision
+					}
+
+					_, err = cl.client.Delete(ctx, maps.Keys(keys)[0])
+					return err
+				},
+			}
+		}
 
 		var expected int64
 		for key := range keys {
-			res, err := Client().(*etcdClient).client.Put(ctx, key, "value")
+			res, err := cl.client.Put(ctx, key, "value")
 			expected = res.Header.Revision
 			require.NoError(t, err)
 		}
 
-		kvs, found, err := Client().(*etcdClient).paginatedList(ctx, log, prefix)
+		kvs, found, err := cl.paginatedList(ctx, log, prefix)
 		require.NoError(t, err)
 
 		for _, kv := range kvs {
@@ -1684,14 +1502,16 @@ func TestPaginatedList(t *testing.T) {
 		if found < expected {
 			t.Fatalf("Next revision (%d) is lower than the one of the last update (%d)", found, expected)
 		}
+
+		if withParallelOps && found >= next {
+			t.Fatalf("Next revision (%d) is higher than the one of subsequent updates (%d)", found, next)
+		}
 	}
 
-	// Batch size = 1
-	run(1)
-
-	// Batch size = 4
-	run(4)
-
-	// Batch size = 11
-	run(11)
+	for _, batchSize := range []int{1, 4, 11} {
+		for _, parallelOps := range []bool{false, true} {
+			t.Run(fmt.Sprintf("batch-size-%d-parallel-ops-%t", batchSize, parallelOps),
+				func(t *testing.T) { run(t, batchSize, parallelOps) })
+		}
+	}
 }

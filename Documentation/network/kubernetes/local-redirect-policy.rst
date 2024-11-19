@@ -6,9 +6,9 @@
 
 .. _local-redirect-policy:
 
-*****************************
-Local Redirect Policy (beta)
-*****************************
+*********************
+Local Redirect Policy
+*********************
 
 This document explains how to configure Cilium's Local Redirect Policy, that
 enables pod traffic destined to an IP address and port/protocol tuple
@@ -35,28 +35,30 @@ When policies are applied, matched pod traffic is redirected. If desired, RBAC
 configurations can be used such that application developers can not escape
 the redirection.
 
-
-.. include:: ../../beta.rst
-
 Prerequisites
 =============
 
-.. note::
-
-   Local Redirect Policy feature requires a v4.19.x or more recent Linux kernel.
-
 .. include:: ../../installation/k8s-install-download-release.rst
 
-The Cilium Local Redirect Policy feature relies on :ref:`kubeproxy-free`,
-follow the guide to create a new deployment. The beta feature is disabled by default.
 Enable the feature by setting the ``localRedirectPolicy`` value to ``true``.
 
 .. parsed-literal::
 
-   helm install cilium |CHART_RELEASE| \\
+   helm upgrade cilium |CHART_RELEASE| \\
+     --namespace kube-system \\
+     --reuse-values \\
      --set localRedirectPolicy=true
 
-Verify that Cilium agent pod is running.
+
+Rollout the operator and agent pods to make the changes effective:
+
+.. code-block:: shell-session
+
+    $ kubectl rollout restart deploy cilium-operator -n kube-system
+    $ kubectl rollout restart ds cilium -n kube-system
+
+
+Verify that Cilium agent and operator pods are running.
 
 .. code-block:: shell-session
 
@@ -64,6 +66,9 @@ Verify that Cilium agent pod is running.
     NAME           READY   STATUS    RESTARTS   AGE
     cilium-5ngzd   1/1     Running   0          3m19s
 
+    $ kubectl -n kube-system get pods -l name=cilium-operator
+    NAME                               READY   STATUS    RESTARTS   AGE
+    cilium-operator-544b4d5cdd-qxvpv   1/1     Running   0          3m19s
 
 Validate that the Cilium Local Redirect Policy CRD has been registered.
 
@@ -73,6 +78,59 @@ Validate that the Cilium Local Redirect Policy CRD has been registered.
 	   NAME                              CREATED AT
 	   [...]
 	   ciliumlocalredirectpolicies.cilium.io              2020-08-24T05:31:47Z
+
+.. note::
+
+    Local Redirect Policy supports either the socket-level loadbalancer or the tc loadbalancer.
+    The configuration depends on your specific use case and the type of service handling required.
+    Below are the Helm setups to work with ``localRedirectPolicy=true``:
+
+    1. Enable full kube-proxy replacement:
+
+      This setup is for users who want to replace kube-proxy with Cilium's eBPF implementation
+      and leverage Local Redirect Policy.
+
+      .. code-block:: yaml
+
+        kubeProxyReplacement: true
+        localRedirectPolicy: true
+
+    2. Bypass the socket-level loadbalancer in pod namespaces:
+
+      This setup is for users who want to disable the socket-level loadbalancer in pod namespaces.
+      For example, this might be needed if there are custom redirection rules in the pod namespace
+      that would conflict with the socket-level load balancer.
+
+      .. code-block:: yaml
+
+        kubeProxyReplacement: true
+        socketLB:
+          hostNamespaceOnly: true
+        localRedirectPolicy: true
+
+    3. Enable the socket-level loadbalancer only:
+
+      This setup is for users who prefer to retain kube-proxy for overall service handling
+      but still want to leverage Cilium's Local Redirect Policy.
+
+      .. code-block:: yaml
+
+        kubeProxyReplacement: false
+        socketLB:
+          enabled: true
+        localRedirectPolicy: true
+
+    4. Disable any service handling except for ClusterIP services accessed from pods:
+
+      If you want to fully rely on kube-proxy for the service handling, you can disable all
+      kube-proxy replacement functionality expect ClusterIP services accessed from pod namespace.
+      Note that the pod traffic from host namespace isn't handled by Local Redirect Policy
+      with this setup.
+
+      .. code-block:: yaml
+
+        kubeProxyReplacement: false
+        localRedirectPolicy: true
 
 Create backend and client pods
 ==============================
@@ -160,9 +218,9 @@ in Cilium pod running on the same node as ``lrp-pod``.
 .. code-block:: shell-session
 
     $ kubectl exec -it -n kube-system cilium-5ngzd -- cilium-dbg service list
-    ID   Frontend               Service Type   Backend
+    ID   Frontend               Service Type       Backend
     [...]
-    4    172.20.0.51:80         ClusterIP      1 => 10.16.70.187:80
+    4    172.20.0.51:80         LocalRedirect      1 => 10.16.70.187:80
 
 Invoke a curl command from the client pod to the IP address and port
 configuration specified in the ``lrp-addr`` custom resource above.
@@ -408,6 +466,39 @@ application pods are now redirected to the ``node-local-dns`` pod.
 In the absence of a node-local DNS cache, DNS queries from application pods
 will get directed to cluster DNS pods backed by the ``kube-dns`` service.
 
+* Troubleshooting
+
+    If DNS requests are failing to resolve, check the following:
+
+        - Ensure that the node-local DNS cache pods are running and ready.
+
+         .. code-block:: shell-session
+
+            $ kubectl --namespace kube-system get pods --selector=k8s-app=node-local-dns
+            NAME                   READY   STATUS    RESTARTS   AGE
+            node-local-dns-72r7m   1/1     Running   0          2d2h
+            node-local-dns-gc5bx   1/1     Running   0          2d2h
+
+        - Check if the local redirect policy has been applied correctly on all the cilium agent pods.
+
+         .. code-block:: shell-session
+
+            $ kubectl exec -it cilium-mhnhz -n kube-system -- cilium-dbg lrp list
+            LRP namespace   LRP name       FrontendType                Matching Service
+            kube-system     nodelocaldns   clusterIP + all svc ports   kube-system/kube-dns
+                            |              10.96.0.10:53/UDP -> 10.244.1.49:53(kube-system/node-local-dns-72r7m),
+                            |              10.96.0.10:53/TCP -> 10.244.1.49:53(kube-system/node-local-dns-72r7m),
+
+        - Check if the corresponding local redirect service entry has been created. If the service entry is missing,
+          there might have been a race condition in applying the policy and the node-local DNS DaemonSet pod resources.
+          As a workaround, you can restart the node-local DNS DaemonSet pods. File a `GitHub issue <https://github.com/cilium/cilium/issues/new/choose>`_
+          with a :ref:`sysdump <sysdump>` if the issue persists.
+
+         .. code-block:: shell-session
+
+            $ kubectl exec -it cilium-mhnhz -n kube-system -- cilium-dbg service list | grep LocalRedirect
+            11   10.96.0.10:53      LocalRedirect   1 => 10.244.1.49:53 (active)
+
 kiam redirect on EKS
 --------------------
 `kiam <https://github.com/uswitch/kiam>`_ agent runs on each node in an EKS
@@ -487,8 +578,7 @@ When a local redirect policy is applied, cilium BPF datapath redirects traffic g
 However, for traffic originating from a node-local backend pod destined to the policy frontend, users may want to
 skip redirecting the traffic back to the node-local backend pod, and instead forward the traffic to the original frontend.
 This behavior can be enabled by setting the ``skipRedirectFromBackend`` flag to ``true`` in the local redirect policy spec.
-The configuration is only supported with socket-based load-balancing, and requires ``SO_NETNS_COOKIE`` feature
-available in Linux kernel version >= 5.8.
+This configuration requires the ``SO_NETNS_COOKIE`` feature available in Linux kernel version >= 5.8.
 
 .. note::
 

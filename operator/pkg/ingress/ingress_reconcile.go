@@ -92,7 +92,7 @@ func (r *ingressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Trying to cleanup the resources of the "other" mode (potential change of mode)
 	if r.isEffectiveLoadbalancerModeDedicated(ingress) {
 		scopedLog.Debug("Updating dedicated resources")
-		if err := r.createOrUpdateDedicatedResources(ctx, ingress); err != nil {
+		if err := r.createOrUpdateDedicatedResources(ctx, ingress, scopedLog); err != nil {
 			if k8serrors.IsForbidden(err) && k8serrors.HasStatusCause(err, corev1.NamespaceTerminatingCause) {
 				// The creation of one of the resources failed because the
 				// namespace is terminating. The ingress itself is also expected
@@ -133,17 +133,17 @@ func (r *ingressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	return controllerruntime.Success()
 }
 
-func (r *ingressReconciler) createOrUpdateDedicatedResources(ctx context.Context, ingress *networkingv1.Ingress) error {
-	desiredCiliumEnvoyConfig, desiredService, desiredEndpoints, err := r.buildDedicatedResources(ctx, ingress)
+func (r *ingressReconciler) createOrUpdateDedicatedResources(ctx context.Context, ingress *networkingv1.Ingress, scopedLog logrus.FieldLogger) error {
+	desiredCiliumEnvoyConfig, desiredService, desiredEndpoints, err := r.buildDedicatedResources(ctx, ingress, scopedLog)
 	if err != nil {
 		return fmt.Errorf("failed to build dedicated resources: %w", err)
 	}
 
-	if err := r.createOrUpdateCiliumEnvoyConfig(ctx, desiredCiliumEnvoyConfig); err != nil {
+	if err := r.createOrUpdateService(ctx, desiredService); err != nil {
 		return err
 	}
 
-	if err := r.createOrUpdateService(ctx, desiredService); err != nil {
+	if err := r.createOrUpdateCiliumEnvoyConfig(ctx, desiredCiliumEnvoyConfig); err != nil {
 		return err
 	}
 
@@ -251,7 +251,7 @@ func (r *ingressReconciler) getSharedListenerPorts() (uint32, uint32, uint32) {
 	return defaultHostNetworkListenerPort, defaultHostNetworkListenerPort, defaultHostNetworkListenerPort
 }
 
-func (r *ingressReconciler) buildDedicatedResources(ctx context.Context, ingress *networkingv1.Ingress) (*ciliumv2.CiliumEnvoyConfig, *corev1.Service, *corev1.Endpoints, error) {
+func (r *ingressReconciler) buildDedicatedResources(ctx context.Context, ingress *networkingv1.Ingress, scopedLog logrus.FieldLogger) (*ciliumv2.CiliumEnvoyConfig, *corev1.Service, *corev1.Endpoints, error) {
 	passthroughPort, insecureHTTPPort, secureHTTPPort := r.getDedicatedListenerPorts(ingress)
 
 	m := &model.Model{}
@@ -268,6 +268,19 @@ func (r *ingressReconciler) buildDedicatedResources(ctx context.Context, ingress
 	}
 
 	r.propagateIngressAnnotationsAndLabels(ingress, &svc.ObjectMeta)
+
+	if svc.Spec.Type == corev1.ServiceTypeLoadBalancer {
+		lbClass := annotations.GetAnnotationLoadBalancerClass(ingress)
+		if lbClass != nil {
+			svc.Spec.LoadBalancerClass = lbClass
+		}
+	}
+
+	eTP, err := annotations.GetAnnotationServiceExternalTrafficPolicy(ingress)
+	if err != nil {
+		scopedLog.WithError(err).Warn("Failed to get externalTrafficPolicy annotation from Ingress object")
+	}
+	svc.Spec.ExternalTrafficPolicy = corev1.ServiceExternalTrafficPolicy(eTP)
 
 	// Explicitly set the controlling OwnerReference on the CiliumEnvoyConfig
 	if err := controllerutil.SetControllerReference(ingress, cec, r.client.Scheme()); err != nil {
@@ -297,6 +310,16 @@ func (r *ingressReconciler) getDedicatedListenerPorts(ingress *networkingv1.Ingr
 func (r *ingressReconciler) createOrUpdateCiliumEnvoyConfig(ctx context.Context, desiredCEC *ciliumv2.CiliumEnvoyConfig) error {
 	cec := desiredCEC.DeepCopy()
 
+	// Delete CiliumEnvoyConfig if no resources are defined.
+	// Otherwise, the subsequent CreateOrUpdate will fail as spec.resources is required field.
+	if len(cec.Spec.Resources) == 0 {
+		err := r.client.Delete(ctx, cec)
+		if err != nil && !k8serrors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete CiliumEnvoyConfig: %w", err)
+		}
+		return nil
+	}
+
 	result, err := controllerutil.CreateOrUpdate(ctx, r.client, cec, func() error {
 		cec.Spec = desiredCEC.Spec
 		cec.OwnerReferences = desiredCEC.OwnerReferences
@@ -323,6 +346,7 @@ func (r *ingressReconciler) createOrUpdateService(ctx context.Context, desiredSe
 		lbClass := svc.Spec.LoadBalancerClass
 		svc.Spec = desiredService.Spec
 		svc.Spec.LoadBalancerClass = lbClass
+		svc.Spec.ExternalTrafficPolicy = desiredService.Spec.ExternalTrafficPolicy
 
 		svc.OwnerReferences = desiredService.OwnerReferences
 		svc.Annotations = mergeMap(svc.Annotations, desiredService.Annotations)

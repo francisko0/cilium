@@ -18,7 +18,7 @@ import (
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/identity/cache"
 	ipcacheTypes "github.com/cilium/cilium/pkg/ipcache/types"
-	"github.com/cilium/cilium/pkg/k8s"
+	"github.com/cilium/cilium/pkg/k8s/synced"
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
@@ -30,36 +30,58 @@ import (
 
 // Identity is the identity representation of an IP<->Identity cache.
 type Identity struct {
-	// ID is the numeric identity
-	ID identity.NumericIdentity
+	// Note: The ordering of these fields is optimized to reduce padding
 
 	// Source is the source of the identity in the cache
 	Source source.Source
+
+	// overwrittenLegacySource contains the source of the original entry created
+	// via legacy API. This is preserved so that original source can be restored
+	// if the metadata API stops managing the entry.
+	overwrittenLegacySource source.Source
+
+	// ID is the numeric identity
+	ID identity.NumericIdentity
 
 	// This blank field ensures that the == operator cannot be used on this
 	// type, to avoid external packages accidentally comparing the private
 	// values below
 	_ []struct{}
 
+	// modifiedByLegacyAPI indicates that this entry touched by the legacy Upsert API.
+	// This informs the metadata subsystem to retain the original source and
+	// to clean up the entry if the legacy API already dropped its reference.
+	// upsertLocked will ensure that this field remains true once set. In other
+	// words, there is no way unset this field once set.
+	// This field is intended to be removed once cilium/cilium#21142 has been
+	// fully implemented and all entries are created via the new metadata API
+	modifiedByLegacyAPI bool
+
 	// shadowed determines if another entry overlaps with this one.
 	// Shadowed identities are not propagated to listeners by default.
 	// Most commonly set for Identity with Source = source.Generated when
 	// a pod IP (other source) has the same IP.
 	shadowed bool
-
-	// createdFromMetadata indicates that this entry was created via the new
-	// metadata API. This is needed to know if it is safe to delete
-	// an IPCache entry when no further metadata is associated with its prefix.
-	// This field is intended to be removed once cilium/cilium#21142 has been
-	// fully implemented and all entries are created via the new metadata API
-	createdFromMetadata bool
 }
 
 func (i Identity) equals(o Identity) bool {
 	return i.ID == o.ID &&
 		i.Source == o.Source &&
 		i.shadowed == o.shadowed &&
-		i.createdFromMetadata == o.createdFromMetadata
+		i.modifiedByLegacyAPI == o.modifiedByLegacyAPI &&
+		i.overwrittenLegacySource == o.overwrittenLegacySource
+}
+
+func (i Identity) exclusivelyOwnedByLegacyAPI() bool {
+	return i.modifiedByLegacyAPI && i.overwrittenLegacySource == ""
+}
+
+func (i Identity) exclusivelyOwnedByMetadataAPI() bool {
+	return !i.modifiedByLegacyAPI
+}
+
+func (i Identity) ownedByLegacyAndMetadataAPI() bool {
+	return i.modifiedByLegacyAPI && i.overwrittenLegacySource != ""
 }
 
 // IPKeyPair is the (IP, key) pair used of the identity
@@ -85,7 +107,7 @@ type Configuration struct {
 	cache.IdentityAllocator
 	ipcacheTypes.PolicyHandler
 	ipcacheTypes.DatapathHandler
-	k8s.CacheStatus
+	synced.CacheStatus
 }
 
 // IPCache is a collection of mappings:
@@ -260,7 +282,7 @@ func (ipc *IPCache) getK8sMetadata(ip string) *K8sMetadata {
 func (ipc *IPCache) Upsert(ip string, hostIP net.IP, hostKey uint8, k8sMeta *K8sMetadata, newIdentity Identity) (namedPortsChanged bool, err error) {
 	ipc.mutex.Lock()
 	defer ipc.mutex.Unlock()
-	return ipc.upsertLocked(ip, hostIP, hostKey, k8sMeta, newIdentity, false /* !force */)
+	return ipc.upsertLocked(ip, hostIP, hostKey, k8sMeta, newIdentity, false /* !force */, true /* fromLegacyAPI */)
 }
 
 // upsertLocked adds / updates the provided IP and identity into the IPCache,
@@ -285,6 +307,7 @@ func (ipc *IPCache) upsertLocked(
 	k8sMeta *K8sMetadata,
 	newIdentity Identity,
 	force bool,
+	fromLegacyAPI bool,
 ) (namedPortsChanged bool, err error) {
 	var newNamedPorts types.NamedPortMap
 	if k8sMeta != nil {
@@ -295,7 +318,7 @@ func (ipc *IPCache) upsertLocked(
 	if option.Config.Debug {
 		scopedLog = log.WithFields(logrus.Fields{
 			logfields.IPAddr:   ip,
-			logfields.Identity: newIdentity,
+			logfields.Identity: &newIdentity,
 			logfields.Key:      hostKey,
 		})
 		if k8sMeta != nil {
@@ -317,10 +340,45 @@ func (ipc *IPCache) upsertLocked(
 
 	cachedIdentity, found := ipc.ipToIdentityCache[ip]
 	if found {
+		// If this is a legacy upsert call,  then we need to make sure that the
+		// overwrittenLegacySource is updated
+		if fromLegacyAPI {
+			switch {
+			case cachedIdentity.exclusivelyOwnedByMetadataAPI():
+				// If the entry was exclusively owned by the metadata API, then we
+				// want to preserve our source as the legacy source (so it can be
+				// restored by the metadata API later) - even if our upsert call is
+				// later rejected due to it being a low-precedence upsert.
+				newIdentity.overwrittenLegacySource = newIdentity.Source
+			case cachedIdentity.ownedByLegacyAndMetadataAPI():
+				// If the entry is owned by both APIs, then it will have overwrittenLegacySource
+				// already set. Thus, check if we should update it, otherwise just preserve it as is.
+				if source.AllowOverwrite(cachedIdentity.overwrittenLegacySource, newIdentity.Source) {
+					newIdentity.overwrittenLegacySource = newIdentity.Source
+				} else {
+					newIdentity.overwrittenLegacySource = cachedIdentity.overwrittenLegacySource
+				}
+			}
+		}
+
+		// Here we track if an entry was previously created via new asynchronous
+		// UpsertMetadata API or the old synchronous Upsert call and preserve that bit
+		if fromLegacyAPI || cachedIdentity.modifiedByLegacyAPI {
+			newIdentity.modifiedByLegacyAPI = true
+		}
+
 		if !force && !source.AllowOverwrite(cachedIdentity.Source, newIdentity.Source) {
 			metrics.IPCacheErrorsTotal.WithLabelValues(
 				metricTypeUpsert, metricErrorOverwrite,
 			).Inc()
+
+			// Even if this update is rejected, we want to update the modifiedByLegacyAPI
+			// and overwrittenLegacySource fields in case the low precedence source here
+			// needs to be restored later
+			cachedIdentity.modifiedByLegacyAPI = newIdentity.modifiedByLegacyAPI
+			cachedIdentity.overwrittenLegacySource = newIdentity.overwrittenLegacySource
+			ipc.ipToIdentityCache[ip] = cachedIdentity
+
 			return false, NewErrOverwrite(cachedIdentity.Source, newIdentity.Source)
 		}
 
@@ -334,16 +392,10 @@ func (ipc *IPCache) upsertLocked(
 			return false, nil
 		}
 
-		// Here we track if an entry was created via new asynchronous
-		// UpsertMetadata API or the old synchronous Upsert call.
-		// If an entry is ever touched via the old Upsert API, we want to keep
-		// createdFromMetadata set to false, and require that the entry
-		// manually is deleted via the Delete function.
-		if !cachedIdentity.createdFromMetadata {
-			newIdentity.createdFromMetadata = false
-		}
-
 		oldIdentity = &cachedIdentity
+	} else if fromLegacyAPI {
+		// If this is a new entry, inserted via legacy API, then track it as such
+		newIdentity.modifiedByLegacyAPI = true
 	}
 
 	// Endpoint IP identities take precedence over CIDR identities, so if the
@@ -472,8 +524,7 @@ func (ipc *IPCache) UpsertMetadataBatch(updates ...MU) (revision uint64) {
 	prefixes := make([]netip.Prefix, 0, len(updates))
 	ipc.metadata.Lock()
 	for _, upd := range updates {
-		ipc.metadata.upsertLocked(upd.Prefix, upd.Source, upd.Resource, upd.Metadata...)
-		prefixes = append(prefixes, upd.Prefix)
+		prefixes = append(prefixes, ipc.metadata.upsertLocked(upd.Prefix, upd.Source, upd.Resource, upd.Metadata...)...)
 	}
 	ipc.metadata.Unlock()
 	revision = ipc.metadata.enqueuePrefixUpdates(prefixes...)
@@ -502,8 +553,7 @@ func (ipc *IPCache) RemoveMetadataBatch(updates ...MU) (revision uint64) {
 	prefixes := make([]netip.Prefix, 0, len(updates))
 	ipc.metadata.Lock()
 	for _, upd := range updates {
-		ipc.metadata.remove(upd.Prefix, upd.Resource, upd.Metadata...)
-		prefixes = append(prefixes, upd.Prefix)
+		prefixes = append(prefixes, ipc.metadata.remove(upd.Prefix, upd.Resource, upd.Metadata...)...)
 	}
 	ipc.metadata.Unlock()
 	revision = ipc.metadata.enqueuePrefixUpdates(prefixes...)
@@ -521,11 +571,12 @@ func (ipc *IPCache) RemoveMetadataBatch(updates ...MU) (revision uint64) {
 // Returns a revision number that can be passed to WaitForRevision().
 func (ipc *IPCache) UpsertPrefixes(prefixes []netip.Prefix, src source.Source, resource ipcacheTypes.ResourceID) (revision uint64) {
 	ipc.metadata.Lock()
+	affectedPrefixed := make([]netip.Prefix, 0, len(prefixes))
 	for _, p := range prefixes {
-		ipc.metadata.upsertLocked(p, src, resource, labels.GetCIDRLabels(p))
+		affectedPrefixed = append(affectedPrefixed, ipc.metadata.upsertLocked(p, src, resource, labels.GetCIDRLabels(p))...)
 	}
 	ipc.metadata.Unlock()
-	revision = ipc.metadata.enqueuePrefixUpdates(prefixes...)
+	revision = ipc.metadata.enqueuePrefixUpdates(affectedPrefixed...)
 	ipc.TriggerLabelInjection()
 	return
 }
@@ -543,11 +594,12 @@ func (ipc *IPCache) UpsertPrefixes(prefixes []netip.Prefix, src source.Source, r
 // to implement the logic associated with the removed CIDR labels.
 func (ipc *IPCache) RemovePrefixes(prefixes []netip.Prefix, src source.Source, resource ipcacheTypes.ResourceID) {
 	ipc.metadata.Lock()
+	affectedPrefixes := make([]netip.Prefix, 0, len(prefixes))
 	for _, p := range prefixes {
-		ipc.metadata.remove(p, resource, labels.GetCIDRLabels(p))
+		affectedPrefixes = append(affectedPrefixes, ipc.metadata.remove(p, resource, labels.GetCIDRLabels(p))...)
 	}
 	ipc.metadata.Unlock()
-	ipc.metadata.enqueuePrefixUpdates(prefixes...)
+	ipc.metadata.enqueuePrefixUpdates(affectedPrefixes...)
 	ipc.TriggerLabelInjection()
 }
 
@@ -603,15 +655,17 @@ func (ipc *IPCache) RemoveIdentityOverride(cidr netip.Prefix, identityLabels lab
 // metadata updates. Thus, the sequence
 //
 //	rev := UpsertMetadataBatch(prefix1, metadata, ...)
-//	WaitForRevision(rev)
+//	WaitForRevision(ctx, rev)
 //
 // means that prefix1 has had at least one call to InjectLabels with the supplied
 // metadata. It does not guarantee that the metadata matches exactly what was
 // passed to UpsertMetadata, as other callers may have also queued modifications.
 //
 // Note that the revision number should be treated as an opaque identifier.
-func (ipc *IPCache) WaitForRevision(desired uint64) {
-	ipc.metadata.waitForRevision(desired)
+// Returns a non-nil error if the provided context was cancelled before the
+// desired revision was reached.
+func (ipc *IPCache) WaitForRevision(ctx context.Context, desired uint64) error {
+	return ipc.metadata.waitForRevision(ctx, desired)
 }
 
 // DumpToListenerLocked dumps the entire contents of the IPCache by triggering

@@ -36,23 +36,21 @@ type ServiceReconcilerOut struct {
 type ServiceReconcilerIn struct {
 	cell.In
 
-	Logger        logrus.FieldLogger
-	PeerAdvert    *CiliumPeerAdvertisement
-	LBIPPoolStore store.BGPCPResourceStore[*v2alpha1.CiliumLoadBalancerIPPool]
-	SvcDiffStore  store.DiffStore[*slim_corev1.Service]
-	EPDiffStore   store.DiffStore[*k8s.Endpoints]
+	Logger       logrus.FieldLogger
+	PeerAdvert   *CiliumPeerAdvertisement
+	SvcDiffStore store.DiffStore[*slim_corev1.Service]
+	EPDiffStore  store.DiffStore[*k8s.Endpoints]
 }
 
 type ServiceReconciler struct {
 	logger       logrus.FieldLogger
 	peerAdvert   *CiliumPeerAdvertisement
-	lbPoolStore  store.BGPCPResourceStore[*v2alpha1.CiliumLoadBalancerIPPool]
 	svcDiffStore store.DiffStore[*slim_corev1.Service]
 	epDiffStore  store.DiffStore[*k8s.Endpoints]
 }
 
 func NewServiceReconciler(in ServiceReconcilerIn) ServiceReconcilerOut {
-	if in.SvcDiffStore == nil || in.EPDiffStore == nil || in.LBIPPoolStore == nil {
+	if in.SvcDiffStore == nil || in.EPDiffStore == nil {
 		return ServiceReconcilerOut{}
 	}
 
@@ -60,7 +58,6 @@ func NewServiceReconciler(in ServiceReconcilerIn) ServiceReconcilerOut {
 		Reconciler: &ServiceReconciler{
 			logger:       in.Logger,
 			peerAdvert:   in.PeerAdvert,
-			lbPoolStore:  in.LBIPPoolStore,
 			svcDiffStore: in.SvcDiffStore,
 			epDiffStore:  in.EPDiffStore,
 		},
@@ -71,8 +68,7 @@ func NewServiceReconciler(in ServiceReconcilerIn) ServiceReconcilerOut {
 type ServiceReconcilerMetadata struct {
 	ServicePaths          ResourceAFPathsMap
 	ServiceAdvertisements PeerAdvertisements
-	ServiceRoutePolicies  ResourceRoutePolicyMap // contains cluster IP and external IP route policies
-	LBPoolRoutePolicies   ResourceRoutePolicyMap // contains load balancer IP pool route policies
+	ServiceRoutePolicies  ResourceRoutePolicyMap
 }
 
 func (r *ServiceReconciler) getMetadata(i *instance.BGPInstance) ServiceReconcilerMetadata {
@@ -81,7 +77,6 @@ func (r *ServiceReconciler) getMetadata(i *instance.BGPInstance) ServiceReconcil
 			ServicePaths:          make(ResourceAFPathsMap),
 			ServiceAdvertisements: make(PeerAdvertisements),
 			ServiceRoutePolicies:  make(ResourceRoutePolicyMap),
-			LBPoolRoutePolicies:   make(ResourceRoutePolicyMap),
 		}
 	}
 	return i.Metadata[r.Name()].(ServiceReconcilerMetadata)
@@ -97,6 +92,22 @@ func (r *ServiceReconciler) Name() string {
 
 func (r *ServiceReconciler) Priority() int {
 	return 40
+}
+
+func (r *ServiceReconciler) Init(i *instance.BGPInstance) error {
+	if i == nil {
+		return fmt.Errorf("BUG: service reconciler initialization with nil BGPInstance")
+	}
+	r.svcDiffStore.InitDiff(r.diffID(i.ASN))
+	r.epDiffStore.InitDiff(r.diffID(i.ASN))
+	return nil
+}
+
+func (r *ServiceReconciler) Cleanup(i *instance.BGPInstance) {
+	if i != nil {
+		r.svcDiffStore.CleanupDiff(r.diffID(i.ASN))
+		r.epDiffStore.CleanupDiff(r.diffID(i.ASN))
+	}
 }
 
 func (r *ServiceReconciler) Reconcile(ctx context.Context, p ReconcileParams) error {
@@ -118,50 +129,51 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, p ReconcileParams) er
 		return fmt.Errorf("failed to populate local services: %w", err)
 	}
 
-	// must be done before reconciling paths and policies since it sets metadata with latest desiredPeerAdverts
 	reqFullReconcile := r.modifiedServiceAdvertisements(p, desiredPeerAdverts)
 
-	return r.reconcileServices(ctx, p, ls, reqFullReconcile)
+	err = r.reconcileServices(ctx, p, desiredPeerAdverts, ls, reqFullReconcile)
+
+	if err == nil && reqFullReconcile {
+		// update svc advertisements in metadata only if the reconciliation was successful
+		r.updateServiceAdvertisementsMetadata(p, desiredPeerAdverts)
+	}
+	return err
 }
 
-func (r *ServiceReconciler) reconcileServices(ctx context.Context, p ReconcileParams, ls sets.Set[resource.Key], fullReconcile bool) error {
-	var desiredSvcRoutePolicies ResourceRoutePolicyMap
-	var desiredSvcPaths ResourceAFPathsMap
-	var err error
+func (r *ServiceReconciler) reconcileServices(ctx context.Context, p ReconcileParams, desiredPeerAdverts PeerAdvertisements, ls sets.Set[resource.Key], fullReconcile bool) error {
+	var (
+		toReconcile []*slim_corev1.Service
+		toWithdraw  []resource.Key
+
+		desiredSvcRoutePolicies ResourceRoutePolicyMap
+		desiredSvcPaths         ResourceAFPathsMap
+
+		err error
+	)
 
 	if fullReconcile {
 		r.logger.Debug("performing all services reconciliation")
 
-		desiredSvcRoutePolicies, err = r.getAllRoutePolicies(p, ls)
-		if err != nil {
-			return err
-		}
-
-		// BGP configuration for service advertisement changed, we should reconcile all services.
-		desiredSvcPaths, err = r.getAllPaths(p, ls)
+		// get all services to reconcile and to withdraw.
+		toReconcile, toWithdraw, err = r.fullReconciliationServiceList(p)
 		if err != nil {
 			return err
 		}
 	} else {
 		r.logger.Debug("performing modified services reconciliation")
 
-		// get services to reconcile and to withdraw.
-		// Note : we should only call svc diff only once in a reconcile loop.
-		toReconcile, toWithdraw, err := r.diffReconciliationServiceList()
+		// get modified services to reconcile and to withdraw.
+		// Note: we should call svc diff only once in a reconcile loop.
+		toReconcile, toWithdraw, err = r.diffReconciliationServiceList(p)
 		if err != nil {
 			return err
 		}
+	}
 
-		desiredSvcRoutePolicies, err = r.getDiffRoutePolicies(p, toReconcile, toWithdraw, ls)
-		if err != nil {
-			return err
-		}
-
-		// BGP configuration is unchanged, only reconcile modified services.
-		desiredSvcPaths, err = r.getDiffPaths(p, toReconcile, toWithdraw, ls)
-		if err != nil {
-			return err
-		}
+	// get desired service route policies
+	desiredSvcRoutePolicies, err = r.getDesiredRoutePolicies(p, desiredPeerAdverts, toReconcile, toWithdraw, ls)
+	if err != nil {
+		return err
 	}
 
 	// reconcile service route policies
@@ -170,10 +182,10 @@ func (r *ServiceReconciler) reconcileServices(ctx context.Context, p ReconcilePa
 		return fmt.Errorf("failed to reconcile service route policies: %w", err)
 	}
 
-	// reconcile LB pool route policies, we always do full reconciliation for LB pool route policies
-	err = r.reconcileLBIPPoolRoutePolicies(ctx, p)
+	// get desired service paths
+	desiredSvcPaths, err = r.getDesiredPaths(p, desiredPeerAdverts, toReconcile, toWithdraw, ls)
 	if err != nil {
-		return fmt.Errorf("failed to reconcile lb route policies: %w", err)
+		return err
 	}
 
 	// reconcile service paths
@@ -183,82 +195,6 @@ func (r *ServiceReconciler) reconcileServices(ctx context.Context, p ReconcilePa
 	}
 
 	return nil
-}
-
-func (r *ServiceReconciler) reconcileLBIPPoolRoutePolicies(ctx context.Context, p ReconcileParams) error {
-	desiredLBRoutePolicies, err := r.getLBIPPoolRoutePolicies(p)
-	if err != nil {
-		return fmt.Errorf("failed to get desired lb route policies: %w", err)
-	}
-
-	metadata := r.getMetadata(p.BGPInstance)
-	for lbPoolKey, desiredLBPoolRoutePolicies := range desiredLBRoutePolicies {
-		currentLBPoolRoutePolicies, exists := metadata.LBPoolRoutePolicies[lbPoolKey]
-		if !exists && len(desiredLBPoolRoutePolicies) == 0 {
-			// no route policies to reconcile
-			continue
-		}
-
-		updatedLBPoolRoutePolicies, rErr := ReconcileRoutePolicies(&ReconcileRoutePoliciesParams{
-			Logger:          r.logger.WithField(types.InstanceLogField, p.DesiredConfig.Name),
-			Ctx:             ctx,
-			Instance:        p.BGPInstance,
-			DesiredPolicies: desiredLBPoolRoutePolicies,
-			CurrentPolicies: currentLBPoolRoutePolicies,
-		})
-
-		if rErr == nil && len(desiredLBPoolRoutePolicies) == 0 {
-			// no error is reported and desiredLBPoolRoutePolicies is empty, we should delete the lbPool
-			delete(metadata.LBPoolRoutePolicies, lbPoolKey)
-		} else {
-			// update lbPool route policies with returned updatedLBPoolRoutePolicies even if there was an error.
-			metadata.LBPoolRoutePolicies[lbPoolKey] = updatedLBPoolRoutePolicies
-		}
-		err = errors.Join(err, rErr)
-	}
-	r.setMetadata(p.BGPInstance, metadata)
-
-	return err
-}
-
-func (r *ServiceReconciler) getLBIPPoolRoutePolicies(p ReconcileParams) (ResourceRoutePolicyMap, error) {
-	metadata := r.getMetadata(p.BGPInstance)
-
-	desiredLBRoutePolicies := make(ResourceRoutePolicyMap)
-
-	for lbPoolKey := range metadata.LBPoolRoutePolicies {
-		_, exists, err := r.lbPoolStore.GetByKey(lbPoolKey)
-		if err != nil {
-			return nil, err
-		}
-
-		if !exists {
-			// mark the route policy for deletion
-			desiredLBRoutePolicies[lbPoolKey] = nil
-		}
-	}
-
-	lbPools, err := r.lbPoolStore.List()
-	if err != nil {
-		return nil, fmt.Errorf("failed to list load balancer IP pools: %w", err)
-	}
-
-	for _, lbPool := range lbPools {
-		desiredLBPoolRoutePolicies, err := r.getLBRoutePolicies(p, lbPool)
-		if err != nil {
-			return nil, err
-		}
-
-		// reconcile route policies for lbPool
-		lbKey := resource.Key{
-			Name:      lbPool.Name,
-			Namespace: lbPool.Namespace,
-		}
-
-		desiredLBRoutePolicies[lbKey] = desiredLBPoolRoutePolicies
-	}
-
-	return desiredLBRoutePolicies, nil
 }
 
 func (r *ServiceReconciler) reconcileSvcRoutePolicies(ctx context.Context, p ReconcileParams, desiredSvcRoutePolicies ResourceRoutePolicyMap) error {
@@ -273,7 +209,7 @@ func (r *ServiceReconciler) reconcileSvcRoutePolicies(ctx context.Context, p Rec
 		updatedSvcRoutePolicies, rErr := ReconcileRoutePolicies(&ReconcileRoutePoliciesParams{
 			Logger:          r.logger.WithField(types.InstanceLogField, p.DesiredConfig.Name),
 			Ctx:             ctx,
-			Instance:        p.BGPInstance,
+			Router:          p.BGPInstance.Router,
 			DesiredPolicies: desiredSvcRoutePolicies,
 			CurrentPolicies: currentSvcRoutePolicies,
 		})
@@ -290,48 +226,7 @@ func (r *ServiceReconciler) reconcileSvcRoutePolicies(ctx context.Context, p Rec
 	return err
 }
 
-func (r *ServiceReconciler) getAllRoutePolicies(p ReconcileParams, ls sets.Set[resource.Key]) (ResourceRoutePolicyMap, error) {
-	desiredSvcRoutePolicies := make(ResourceRoutePolicyMap)
-
-	// check for services which are no longer present
-	svcRoutePolicies := r.getMetadata(p.BGPInstance).ServiceRoutePolicies
-	for svcKey := range svcRoutePolicies {
-		_, exists, err := r.svcDiffStore.GetByKey(svcKey)
-		if err != nil {
-			return nil, fmt.Errorf("svcDiffStore.GetByKey(): %w", err)
-		}
-
-		// if the service no longer exists, withdraw it
-		if !exists {
-			desiredSvcRoutePolicies[svcKey] = nil
-		}
-	}
-
-	// check all services for route policies
-	svcList, err := r.svcDiffStore.List()
-	if err != nil {
-		return nil, fmt.Errorf("failed to list services from svcDiffstore: %w", err)
-	}
-
-	for _, svc := range svcList {
-		svcKey := resource.Key{
-			Name:      svc.GetName(),
-			Namespace: svc.GetNamespace(),
-		}
-
-		// get desired route policies for the service
-		svcRoutePolicies, err := r.getDesiredSvcRoutePolicies(p, svc, ls)
-		if err != nil {
-			return nil, err
-		}
-
-		desiredSvcRoutePolicies[svcKey] = svcRoutePolicies
-	}
-
-	return desiredSvcRoutePolicies, nil
-}
-
-func (r *ServiceReconciler) getDiffRoutePolicies(p ReconcileParams, toUpdate []*slim_corev1.Service, toRemove []resource.Key, ls sets.Set[resource.Key]) (ResourceRoutePolicyMap, error) {
+func (r *ServiceReconciler) getDesiredRoutePolicies(p ReconcileParams, desiredPeerAdverts PeerAdvertisements, toUpdate []*slim_corev1.Service, toRemove []resource.Key, ls sets.Set[resource.Key]) (ResourceRoutePolicyMap, error) {
 	desiredSvcRoutePolicies := make(ResourceRoutePolicyMap)
 
 	for _, svc := range toUpdate {
@@ -341,7 +236,7 @@ func (r *ServiceReconciler) getDiffRoutePolicies(p ReconcileParams, toUpdate []*
 		}
 
 		// get desired route policies for the service
-		svcRoutePolicies, err := r.getDesiredSvcRoutePolicies(p, svc, ls)
+		svcRoutePolicies, err := r.getDesiredSvcRoutePolicies(p, desiredPeerAdverts, svc, ls)
 		if err != nil {
 			return nil, err
 		}
@@ -357,63 +252,70 @@ func (r *ServiceReconciler) getDiffRoutePolicies(p ReconcileParams, toUpdate []*
 	return desiredSvcRoutePolicies, nil
 }
 
-func (r *ServiceReconciler) getDesiredSvcRoutePolicies(p ReconcileParams, svc *slim_corev1.Service, ls sets.Set[resource.Key]) (RoutePolicyMap, error) {
-	// get cluster IP route policy
-	desiredClusterRoutePolicies, err := r.getClusterIPRoutePolicies(p, svc, ls)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get desired cluster IP route policies: %w", err)
+func (r *ServiceReconciler) getDesiredSvcRoutePolicies(p ReconcileParams, desiredPeerAdverts PeerAdvertisements, svc *slim_corev1.Service, ls sets.Set[resource.Key]) (RoutePolicyMap, error) {
+	desiredSvcRoutePolicies := make(RoutePolicyMap)
+
+	for peer, afAdverts := range desiredPeerAdverts {
+		for fam, adverts := range afAdverts {
+			agentFamily := types.ToAgentFamily(fam)
+
+			for _, advert := range adverts {
+				labelSelector, err := slim_metav1.LabelSelectorAsSelector(advert.Selector)
+				if err != nil {
+					return nil, fmt.Errorf("failed constructing LabelSelector: %w", err)
+				}
+				if !labelSelector.Matches(serviceLabelSet(svc)) {
+					continue
+				}
+				// LoadBalancerIP
+				lbPolicy, err := r.getLoadBalancerIPRoutePolicy(p, peer, agentFamily, svc, advert, ls)
+				if err != nil {
+					return nil, fmt.Errorf("failed to get desired LoadBalancerIP route policy: %w", err)
+				}
+				if lbPolicy != nil {
+					desiredSvcRoutePolicies[lbPolicy.Name] = lbPolicy
+				}
+				// ExternalIP
+				extPolicy, err := r.getExternalIPRoutePolicy(p, peer, agentFamily, svc, advert, ls)
+				if err != nil {
+					return nil, fmt.Errorf("failed to get desired ExternalIP route policy: %w", err)
+				}
+				if extPolicy != nil {
+					desiredSvcRoutePolicies[extPolicy.Name] = extPolicy
+				}
+				// ClusterIP
+				clusterPolicy, err := r.getClusterIPRoutePolicy(p, peer, agentFamily, svc, advert, ls)
+				if err != nil {
+					return nil, fmt.Errorf("failed to get desired ClusterIP route policy: %w", err)
+				}
+				if clusterPolicy != nil {
+					desiredSvcRoutePolicies[clusterPolicy.Name] = clusterPolicy
+				}
+			}
+		}
 	}
 
-	desiredExternalIPRoutePolicies, err := r.getExternalIPRoutePolicies(p, svc, ls)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get desired external IP route policies: %w", err)
-	}
-
-	// merge two route policies, both will have unique names since name contains advertisement type
-	desiredSvcRPs := desiredClusterRoutePolicies
-	for k, v := range desiredExternalIPRoutePolicies {
-		desiredSvcRPs[k] = v
-	}
-
-	return desiredSvcRPs, nil
+	return desiredSvcRoutePolicies, nil
 }
 
 func (r *ServiceReconciler) reconcilePaths(ctx context.Context, p ReconcileParams, desiredSvcPaths ResourceAFPathsMap) error {
 	var err error
 	metadata := r.getMetadata(p.BGPInstance)
-	for svc, desiredAFPaths := range desiredSvcPaths {
-		// check if service exists
-		currentAFPaths, exists := metadata.ServicePaths[svc]
-		if !exists && len(desiredAFPaths) == 0 {
-			// service does not exist in our local state, and there is nothing to advertise
-			continue
-		}
 
-		// reconcile service paths
-		updatedAFPaths, rErr := ReconcileAFPaths(&ReconcileAFPathsParams{
-			Logger:       r.logger.WithField(types.InstanceLogField, p.DesiredConfig.Name),
-			Ctx:          ctx,
-			Instance:     p.BGPInstance,
-			DesiredPaths: desiredAFPaths,
-			CurrentPaths: currentAFPaths,
-		})
+	metadata.ServicePaths, err = ReconcileResourceAFPaths(ReconcileResourceAFPathsParams{
+		Logger:                 r.logger.WithField(types.InstanceLogField, p.DesiredConfig.Name),
+		Ctx:                    ctx,
+		Router:                 p.BGPInstance.Router,
+		DesiredResourceAFPaths: desiredSvcPaths,
+		CurrentResourceAFPaths: metadata.ServicePaths,
+	})
 
-		if rErr == nil && len(desiredAFPaths) == 0 {
-			// no error is reported and desiredAFPaths is empty, we should delete the service
-			delete(metadata.ServicePaths, svc)
-		} else {
-			// update service paths with returned updatedAFPaths even if there was an error.
-			metadata.ServicePaths[svc] = updatedAFPaths
-		}
-		err = errors.Join(err, rErr)
-	}
 	r.setMetadata(p.BGPInstance, metadata)
-
 	return err
 }
 
-// modifiedServiceAdvertisements compares local advertisement state with desiredPeerAdverts, if they differ, it updates the local state and returns true
-// for full reconciliation.
+// modifiedServiceAdvertisements compares local advertisement state with desiredPeerAdverts, if they differ,
+// returns true signaling that full reconciliation is required.
 func (r *ServiceReconciler) modifiedServiceAdvertisements(p ReconcileParams, desiredPeerAdverts PeerAdvertisements) bool {
 	// current metadata
 	serviceMetadata := r.getMetadata(p.BGPInstance)
@@ -421,17 +323,20 @@ func (r *ServiceReconciler) modifiedServiceAdvertisements(p ReconcileParams, des
 	// check if BGP advertisement configuration modified
 	modified := !PeerAdvertisementsEqual(serviceMetadata.ServiceAdvertisements, desiredPeerAdverts)
 
-	// update local state, if modified
-	if modified {
-		r.setMetadata(p.BGPInstance, ServiceReconcilerMetadata{
-			ServicePaths:          serviceMetadata.ServicePaths,
-			ServiceRoutePolicies:  serviceMetadata.ServiceRoutePolicies,
-			LBPoolRoutePolicies:   serviceMetadata.LBPoolRoutePolicies,
-			ServiceAdvertisements: desiredPeerAdverts,
-		})
-	}
-
 	return modified
+}
+
+// updateServiceAdvertisementsMetadata updates the provided ServiceAdvertisements in the reconciler metadata.
+func (r *ServiceReconciler) updateServiceAdvertisementsMetadata(p ReconcileParams, peerAdverts PeerAdvertisements) {
+	// current metadata
+	serviceMetadata := r.getMetadata(p.BGPInstance)
+
+	// update ServiceAdvertisements in the metadata
+	r.setMetadata(p.BGPInstance, ServiceReconcilerMetadata{
+		ServicePaths:          serviceMetadata.ServicePaths,
+		ServiceRoutePolicies:  serviceMetadata.ServiceRoutePolicies,
+		ServiceAdvertisements: peerAdverts,
+	})
 }
 
 // Populate locally available services used for externalTrafficPolicy=local handling
@@ -462,7 +367,7 @@ endpointsLoop:
 		}
 
 		for _, be := range eps.Backends {
-			if be.NodeName == localNodeName {
+			if !be.Terminating && be.NodeName == localNodeName {
 				// At least one endpoint is available on this node. We
 				// can add service to the local services set.
 				ls.Insert(svcKey)
@@ -486,74 +391,37 @@ func (r *ServiceReconciler) resolveSvcFromEndpoints(eps *k8s.Endpoints) (*slim_c
 	return r.svcDiffStore.GetByKey(k)
 }
 
-func (r *ServiceReconciler) getAllPaths(p ReconcileParams, ls sets.Set[resource.Key]) (ResourceAFPathsMap, error) {
-	desiredServiceAFPaths := make(ResourceAFPathsMap)
+func (r *ServiceReconciler) fullReconciliationServiceList(p ReconcileParams) (toReconcile []*slim_corev1.Service, toWithdraw []resource.Key, err error) {
+	// re-init diff in diffstores, so that it contains only changes since the last full reconciliation.
+	r.svcDiffStore.InitDiff(r.diffID(p.BGPInstance.ASN))
+	r.epDiffStore.InitDiff(r.diffID(p.BGPInstance.ASN))
 
 	// check for services which are no longer present
 	serviceAFPaths := r.getMetadata(p.BGPInstance).ServicePaths
 	for svcKey := range serviceAFPaths {
 		_, exists, err := r.svcDiffStore.GetByKey(svcKey)
 		if err != nil {
-			return nil, fmt.Errorf("svcDiffStore.GetByKey(): %w", err)
+			return nil, nil, fmt.Errorf("svcDiffStore.GetByKey(): %w", err)
 		}
 
 		// if the service no longer exists, withdraw it
 		if !exists {
-			desiredServiceAFPaths[svcKey] = nil
+			toWithdraw = append(toWithdraw, svcKey)
 		}
 	}
 
 	// check all services for advertisement
-	svcList, err := r.svcDiffStore.List()
+	toReconcile, err = r.svcDiffStore.List()
 	if err != nil {
-		return nil, fmt.Errorf("failed to list services from svcDiffstore: %w", err)
+		return nil, nil, fmt.Errorf("failed to list services from svcDiffstore: %w", err)
 	}
-
-	for _, svc := range svcList {
-		svcKey := resource.Key{
-			Name:      svc.GetName(),
-			Namespace: svc.GetNamespace(),
-		}
-
-		afPaths, err := r.getServiceAFPaths(p, svc, ls)
-		if err != nil {
-			return nil, err
-		}
-
-		desiredServiceAFPaths[svcKey] = afPaths
-	}
-
-	return desiredServiceAFPaths, nil
-}
-
-func (r *ServiceReconciler) getDiffPaths(p ReconcileParams, toReconcile []*slim_corev1.Service, toWithdraw []resource.Key, ls sets.Set[resource.Key]) (ResourceAFPathsMap, error) {
-	desiredServiceAFPaths := make(ResourceAFPathsMap)
-	for _, svc := range toReconcile {
-		svcKey := resource.Key{
-			Name:      svc.GetName(),
-			Namespace: svc.GetNamespace(),
-		}
-
-		afPaths, err := r.getServiceAFPaths(p, svc, ls)
-		if err != nil {
-			return nil, err
-		}
-
-		desiredServiceAFPaths[svcKey] = afPaths
-	}
-
-	for _, svcKey := range toWithdraw {
-		// for withdrawn services, we need to set paths to nil.
-		desiredServiceAFPaths[svcKey] = nil
-	}
-
-	return desiredServiceAFPaths, nil
+	return
 }
 
 // diffReconciliationServiceList returns a list of services to reconcile and to withdraw when
 // performing partial (diff) service reconciliation.
-func (r *ServiceReconciler) diffReconciliationServiceList() (toReconcile []*slim_corev1.Service, toWithdraw []resource.Key, err error) {
-	upserted, deleted, err := r.svcDiffStore.Diff()
+func (r *ServiceReconciler) diffReconciliationServiceList(p ReconcileParams) (toReconcile []*slim_corev1.Service, toWithdraw []resource.Key, err error) {
+	upserted, deleted, err := r.svcDiffStore.Diff(r.diffID(p.BGPInstance.ASN))
 	if err != nil {
 		return nil, nil, fmt.Errorf("svc store diff: %w", err)
 	}
@@ -564,7 +432,7 @@ func (r *ServiceReconciler) diffReconciliationServiceList() (toReconcile []*slim
 	// We don't handle service deletion here since we only see
 	// the key, we cannot resolve associated service, so we have
 	// nothing to do.
-	epsUpserted, _, err := r.epDiffStore.Diff()
+	epsUpserted, _, err := r.epDiffStore.Diff(r.diffID(p.BGPInstance.ASN))
 	if err != nil {
 		return nil, nil, fmt.Errorf("EPs store diff: %w", err)
 	}
@@ -603,11 +471,34 @@ func (r *ServiceReconciler) diffReconciliationServiceList() (toReconcile []*slim
 	return deduped, deleted, nil
 }
 
-func (r *ServiceReconciler) getServiceAFPaths(p ReconcileParams, svc *slim_corev1.Service, ls sets.Set[resource.Key]) (AFPathsMap, error) {
-	desiredFamilyAdverts := make(AFPathsMap)
-	metadata := r.getMetadata(p.BGPInstance)
+func (r *ServiceReconciler) getDesiredPaths(p ReconcileParams, desiredPeerAdverts PeerAdvertisements, toReconcile []*slim_corev1.Service, toWithdraw []resource.Key, ls sets.Set[resource.Key]) (ResourceAFPathsMap, error) {
+	desiredServiceAFPaths := make(ResourceAFPathsMap)
+	for _, svc := range toReconcile {
+		svcKey := resource.Key{
+			Name:      svc.GetName(),
+			Namespace: svc.GetNamespace(),
+		}
 
-	for _, peerFamilyAdverts := range metadata.ServiceAdvertisements {
+		afPaths, err := r.getServiceAFPaths(p, desiredPeerAdverts, svc, ls)
+		if err != nil {
+			return nil, err
+		}
+
+		desiredServiceAFPaths[svcKey] = afPaths
+	}
+
+	for _, svcKey := range toWithdraw {
+		// for withdrawn services, we need to set paths to nil.
+		desiredServiceAFPaths[svcKey] = nil
+	}
+
+	return desiredServiceAFPaths, nil
+}
+
+func (r *ServiceReconciler) getServiceAFPaths(p ReconcileParams, desiredPeerAdverts PeerAdvertisements, svc *slim_corev1.Service, ls sets.Set[resource.Key]) (AFPathsMap, error) {
+	desiredFamilyAdverts := make(AFPathsMap)
+
+	for _, peerFamilyAdverts := range desiredPeerAdverts {
 		for family, familyAdverts := range peerFamilyAdverts {
 			agentFamily := types.ToAgentFamily(family)
 
@@ -751,30 +642,22 @@ func (r *ServiceReconciler) getLBSvcPaths(svc *slim_corev1.Service, ls sets.Set[
 	return desiredRoutes
 }
 
-func (r *ServiceReconciler) getLBRoutePolicies(p ReconcileParams, lbPool *v2alpha1.CiliumLoadBalancerIPPool) (RoutePolicyMap, error) {
-	desiredLBPoolRoutePolicies := make(RoutePolicyMap)
-
-	for peer, afAdverts := range r.getMetadata(p.BGPInstance).ServiceAdvertisements {
-		for fam, adverts := range afAdverts {
-			agentFamily := types.ToAgentFamily(fam)
-
-			for _, advert := range adverts {
-				policy, err := r.getLBRoutePolicy(p, peer, agentFamily, lbPool, advert)
-				if err != nil {
-					return nil, fmt.Errorf("failed to get desired lb route policy: %w", err)
-				}
-				if policy != nil {
-					desiredLBPoolRoutePolicies[policy.Name] = policy
-				}
-			}
-		}
+func (r *ServiceReconciler) getLoadBalancerIPRoutePolicy(p ReconcileParams, peer string, family types.Family, svc *slim_corev1.Service, advert v2alpha1.BGPAdvertisement, ls sets.Set[resource.Key]) (*types.RoutePolicy, error) {
+	if svc.Spec.Type != slim_corev1.ServiceTypeLoadBalancer {
+		return nil, nil
+	}
+	// Ignore externalTrafficPolicy == Local && no local EPs.
+	if svc.Spec.ExternalTrafficPolicy == slim_corev1.ServiceExternalTrafficPolicyLocal &&
+		!hasLocalEndpoints(svc, ls) {
+		return nil, nil
+	}
+	// Ignore service managed by an unsupported LB class.
+	if svc.Spec.LoadBalancerClass != nil && *svc.Spec.LoadBalancerClass != v2alpha1.BGPLoadBalancerClass {
+		// The service is managed by a different LB class.
+		return nil, nil
 	}
 
-	return desiredLBPoolRoutePolicies, nil
-}
-
-func (r *ServiceReconciler) getLBRoutePolicy(p ReconcileParams, peer string, family types.Family, lbPool *v2alpha1.CiliumLoadBalancerIPPool, advert v2alpha1.BGPAdvertisement) (*types.RoutePolicy, error) {
-
+	// get the peer address
 	peerAddr, err := GetPeerAddressFromConfig(p.DesiredConfig, peer)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get peer address: %w", err)
@@ -784,73 +667,37 @@ func (r *ServiceReconciler) getLBRoutePolicy(p ReconcileParams, peer string, fam
 	if err != nil {
 		return nil, fmt.Errorf("failed to check service advertisement: %w", err)
 	}
-
-	if !valid || lbPool.Spec.Disabled {
-		return nil, nil
-	}
-
-	labelSelector, err := slim_metav1.LabelSelectorAsSelector(advert.Selector)
-	if err != nil {
-		return nil, fmt.Errorf("failed constructing LabelSelector: %w", err)
-	}
-
-	// check if advertisement matches lb pool labels
-	if !labelSelector.Matches(labels.Set(lbPool.Labels)) {
+	if !valid {
 		return nil, nil
 	}
 
 	var v4Prefixes, v6Prefixes types.PolicyPrefixMatchList
-
-	for _, cidrBlock := range lbPool.Spec.Blocks {
-		cidr, err := netip.ParsePrefix(string(cidrBlock.Cidr))
+	for _, ingress := range svc.Status.LoadBalancer.Ingress {
+		addr, err := netip.ParseAddr(ingress.IP)
 		if err != nil {
-			r.logger.WithError(err).Warnf("failed to parse IPAM pool CIDR %s", cidrBlock.Cidr)
 			continue
 		}
 
-		if family.Afi == types.AfiIPv4 && cidr.Addr().Is4() {
-			v4Prefixes = append(v4Prefixes, &types.RoutePolicyPrefixMatch{CIDR: cidr, PrefixLenMin: MaxPrefixLenIPv4, PrefixLenMax: MaxPrefixLenIPv4})
+		if family.Afi == types.AfiIPv4 && addr.Is4() {
+			v4Prefixes = append(v4Prefixes, &types.RoutePolicyPrefixMatch{CIDR: netip.PrefixFrom(addr, addr.BitLen()), PrefixLenMin: addr.BitLen(), PrefixLenMax: addr.BitLen()})
 		}
 
-		if family.Afi == types.AfiIPv6 && cidr.Addr().Is6() {
-			v6Prefixes = append(v6Prefixes, &types.RoutePolicyPrefixMatch{CIDR: cidr, PrefixLenMin: MaxPrefixLenIPv6, PrefixLenMax: MaxPrefixLenIPv6})
+		if family.Afi == types.AfiIPv6 && addr.Is6() {
+			v6Prefixes = append(v6Prefixes, &types.RoutePolicyPrefixMatch{CIDR: netip.PrefixFrom(addr, addr.BitLen()), PrefixLenMin: addr.BitLen(), PrefixLenMax: addr.BitLen()})
 		}
 	}
 
-	// if there are no prefixes found, return nil
 	if len(v4Prefixes) == 0 && len(v6Prefixes) == 0 {
 		return nil, nil
 	}
 
-	policyName := PolicyName(peer, family.Afi.String(), fmt.Sprintf("%s-%s", lbPool.Name, lbPool.Namespace))
+	policyName := PolicyName(peer, family.Afi.String(), advert.AdvertisementType, fmt.Sprintf("%s-%s-%s", svc.Name, svc.Namespace, v2alpha1.BGPLoadBalancerIPAddr))
 	policy, err := CreatePolicy(policyName, peerAddr, v4Prefixes, v6Prefixes, advert)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create lb pool route policy: %w", err)
+		return nil, fmt.Errorf("failed to create LoadBalancer IP route policy: %w", err)
 	}
 
 	return policy, nil
-}
-
-func (r *ServiceReconciler) getExternalIPRoutePolicies(p ReconcileParams, svc *slim_corev1.Service, ls sets.Set[resource.Key]) (RoutePolicyMap, error) {
-	desiredSvcRoutePolicies := make(RoutePolicyMap)
-
-	for peer, afAdverts := range r.getMetadata(p.BGPInstance).ServiceAdvertisements {
-		for fam, adverts := range afAdverts {
-			agentFamily := types.ToAgentFamily(fam)
-
-			for _, advert := range adverts {
-				policy, err := r.getExternalIPRoutePolicy(p, peer, agentFamily, svc, advert, ls)
-				if err != nil {
-					return nil, fmt.Errorf("failed to get desired external IP route policy: %w", err)
-				}
-				if policy != nil {
-					desiredSvcRoutePolicies[policy.Name] = policy
-				}
-			}
-		}
-	}
-
-	return desiredSvcRoutePolicies, nil
 }
 
 func (r *ServiceReconciler) getExternalIPRoutePolicy(p ReconcileParams, peer string, family types.Family, svc *slim_corev1.Service, advert v2alpha1.BGPAdvertisement, ls sets.Set[resource.Key]) (*types.RoutePolicy, error) {
@@ -866,15 +713,6 @@ func (r *ServiceReconciler) getExternalIPRoutePolicy(p ReconcileParams, peer str
 	}
 
 	if !valid {
-		return nil, nil
-	}
-
-	labelSelector, err := slim_metav1.LabelSelectorAsSelector(advert.Selector)
-	if err != nil {
-		return nil, fmt.Errorf("failed constructing LabelSelector: %w", err)
-	}
-
-	if !labelSelector.Matches(serviceLabelSet(svc)) {
 		return nil, nil
 	}
 
@@ -907,35 +745,13 @@ func (r *ServiceReconciler) getExternalIPRoutePolicy(p ReconcileParams, peer str
 		return nil, nil
 	}
 
-	policyName := PolicyName(peer, family.Afi.String(), fmt.Sprintf("%s-%s-%s", svc.Name, svc.Namespace, v2alpha1.BGPExternalIPAddr))
+	policyName := PolicyName(peer, family.Afi.String(), advert.AdvertisementType, fmt.Sprintf("%s-%s-%s", svc.Name, svc.Namespace, v2alpha1.BGPExternalIPAddr))
 	policy, err := CreatePolicy(policyName, peerAddr, v4Prefixes, v6Prefixes, advert)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create external IP route policy: %w", err)
 	}
 
 	return policy, nil
-}
-
-func (r *ServiceReconciler) getClusterIPRoutePolicies(p ReconcileParams, svc *slim_corev1.Service, ls sets.Set[resource.Key]) (RoutePolicyMap, error) {
-	desiredSvcRoutePolicies := make(RoutePolicyMap)
-
-	for peer, afAdverts := range r.getMetadata(p.BGPInstance).ServiceAdvertisements {
-		for fam, adverts := range afAdverts {
-			agentFamily := types.ToAgentFamily(fam)
-
-			for _, advert := range adverts {
-				policy, err := r.getClusterIPRoutePolicy(p, peer, agentFamily, svc, advert, ls)
-				if err != nil {
-					return nil, fmt.Errorf("failed to get desired cluster IP route policy: %w", err)
-				}
-				if policy != nil {
-					desiredSvcRoutePolicies[policy.Name] = policy
-				}
-			}
-		}
-	}
-
-	return desiredSvcRoutePolicies, nil
 }
 
 func (r *ServiceReconciler) getClusterIPRoutePolicy(p ReconcileParams, peer string, family types.Family, svc *slim_corev1.Service, advert v2alpha1.BGPAdvertisement, ls sets.Set[resource.Key]) (*types.RoutePolicy, error) {
@@ -951,15 +767,6 @@ func (r *ServiceReconciler) getClusterIPRoutePolicy(p ReconcileParams, peer stri
 	}
 
 	if !valid {
-		return nil, nil
-	}
-
-	labelSelector, err := slim_metav1.LabelSelectorAsSelector(advert.Selector)
-	if err != nil {
-		return nil, fmt.Errorf("failed constructing LabelSelector: %w", err)
-	}
-
-	if !labelSelector.Matches(serviceLabelSet(svc)) {
 		return nil, nil
 	}
 
@@ -1000,7 +807,7 @@ func (r *ServiceReconciler) getClusterIPRoutePolicy(p ReconcileParams, peer stri
 		return nil, nil
 	}
 
-	policyName := PolicyName(peer, family.Afi.String(), fmt.Sprintf("%s-%s-%s", svc.Name, svc.Namespace, v2alpha1.BGPClusterIPAddr))
+	policyName := PolicyName(peer, family.Afi.String(), advert.AdvertisementType, fmt.Sprintf("%s-%s-%s", svc.Name, svc.Namespace, v2alpha1.BGPClusterIPAddr))
 	policy, err := CreatePolicy(policyName, peerAddr, v4Prefixes, v6Prefixes, advert)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create cluster IP route policy: %w", err)
@@ -1009,10 +816,14 @@ func (r *ServiceReconciler) getClusterIPRoutePolicy(p ReconcileParams, peer stri
 	return policy, nil
 }
 
+func (r *ServiceReconciler) diffID(asn uint32) string {
+	return fmt.Sprintf("%s-%d", r.Name(), asn)
+}
+
 // checkServiceAdvertisement checks if the service advertisement is enabled in the advertisement.
 func checkServiceAdvertisement(advert v2alpha1.BGPAdvertisement, advertServiceType v2alpha1.BGPServiceAddressType) (bool, error) {
 	if advert.Service == nil {
-		return false, fmt.Errorf("BUG: advertisement has no service options")
+		return false, fmt.Errorf("advertisement has no service options")
 	}
 
 	// If selector is nil, we do not use this advertisement.

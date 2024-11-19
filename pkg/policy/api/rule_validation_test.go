@@ -590,6 +590,10 @@ func TestCIDRsanitize(t *testing.T) {
 	err = cidr.sanitize()
 	require.Nil(t, err)
 
+	cidr = CIDRRule{Cidr: "", CIDRGroupRef: "cidrgroup"}
+	err = cidr.sanitize()
+	require.Nil(t, err)
+
 	cidr = CIDRRule{Cidr: "2001:0db8:85a3:0000:0000:8a2e:0370:7334/128"}
 	err = cidr.sanitize()
 	require.Nil(t, err)
@@ -717,6 +721,34 @@ func TestL7Rules(t *testing.T) {
 
 	err = invalidL7Rule.Sanitize()
 	require.NotNil(t, err)
+}
+
+// This test ensures that DNS rules do not accept port ranges
+func TestPortRangesNotAllowedWithDNSRules(t *testing.T) {
+	// Rule is invalid because DNS rules do not support port ranges.
+	invalidPortRule := Rule{
+		EndpointSelector: WildcardEndpointSelector,
+		Egress: []EgressRule{
+			{
+				EgressCommonRule: EgressCommonRule{
+					ToEndpoints: []EndpointSelector{WildcardEndpointSelector},
+				},
+				ToPorts: []PortRule{{
+					Ports: []PortProtocol{
+						{Port: "443", EndPort: 445, Protocol: ProtoTCP},
+					},
+					Rules: &L7Rules{
+						DNS: []PortRuleDNS{
+							{MatchName: "www.google.com"},
+						},
+					},
+				}},
+			},
+		},
+	}
+	err := invalidPortRule.Sanitize()
+	require.NotNil(t, err)
+	require.Equal(t, "DNS rules do not support port ranges", err.Error())
 }
 
 // This test ensures that host policies with L7 rules are rejected.

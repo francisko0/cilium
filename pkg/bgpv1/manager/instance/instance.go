@@ -22,6 +22,9 @@ import (
 //
 // This is used in BGPv1 implementation.
 type ServerWithConfig struct {
+	// ASN is the local ASN number of the virtual router instance.
+	ASN uint32
+
 	// backed BgpServer configured in accordance to the accompanying
 	// CiliumBGPVirtualRouter configuration.
 	Server types.Router
@@ -52,6 +55,7 @@ func NewServerWithConfig(ctx context.Context, log *logrus.Entry, params types.Se
 		return nil, err
 	}
 	return &ServerWithConfig{
+		ASN:                params.Global.ASN,
 		Server:             s,
 		Config:             nil,
 		ReconcilerMetadata: make(map[string]any),
@@ -62,9 +66,11 @@ func NewServerWithConfig(ctx context.Context, log *logrus.Entry, params types.Se
 //
 // This is used in BGPv2 implementation.
 type BGPInstance struct {
-	Config   *v2alpha1api.CiliumBGPNodeInstance
-	Router   types.Router
-	Metadata map[string]any
+	ASN       uint32
+	Config    *v2alpha1api.CiliumBGPNodeInstance
+	Router    types.Router
+	Metadata  map[string]any
+	CancelCtx context.CancelFunc
 }
 
 // NewBGPInstance will start an underlying BGP instance utilizing types.ServerParameters
@@ -76,14 +82,18 @@ type BGPInstance struct {
 // Canceling the provided context will kill the BGP instance along with calling the
 // underlying Router's Stop() method.
 func NewBGPInstance(ctx context.Context, log *logrus.Entry, params types.ServerParameters) (*BGPInstance, error) {
-	s, err := gobgp.NewGoBGPServer(ctx, log, params)
+	gobgpCtx, cancel := context.WithCancel(ctx)
+	s, err := gobgp.NewGoBGPServer(gobgpCtx, log, params)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 
 	return &BGPInstance{
-		Config:   nil,
-		Router:   s,
-		Metadata: make(map[string]any),
+		ASN:       params.Global.ASN,
+		CancelCtx: cancel,
+		Config:    nil,
+		Router:    s,
+		Metadata:  make(map[string]any),
 	}, nil
 }

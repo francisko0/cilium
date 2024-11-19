@@ -20,8 +20,9 @@ on:
 
   push:
     branches:
-      - main
-      - ft/main/**
+      - v1.16
+      - ft/v1.16/**
+      - 'renovate/v1.16-**'
     paths-ignore:
       - 'Documentation/**'
 
@@ -68,14 +69,13 @@ jobs:
   echo-inputs:
     if: ${{ github.event_name == 'workflow_dispatch' }}
     name: Echo Workflow Dispatch Inputs
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Echo Workflow Dispatch Inputs
         run: |
           echo '${{ tojson(inputs) }}'
 
   commit-status-start:
-    if: ${{ github.event_name != 'push' }}
     name: Commit Status Start
     runs-on: ubuntu-latest
     steps:
@@ -86,7 +86,7 @@ jobs:
 
   upgrade-and-downgrade:
     name: "Upgrade and Downgrade Test"
-    runs-on: ${{ vars.GH_RUNNER_EXTRA_POWER }}
+    runs-on: ${{ vars.GH_RUNNER_EXTRA_POWER_UBUNTU_LATEST || 'ubuntu-latest' }}
     timeout-minutes: 60
     env:
       job_name: "Installation and Connectivity Test"
@@ -100,12 +100,14 @@ jobs:
             kube-proxy: 'iptables'
             external-kvstore: false
             max-connected-clusters: 255
+            cm-auth-mode: 'legacy'
 
           - name: '2'
             encryption: 'disabled'
             kube-proxy: 'none'
             external-kvstore: false
             max-connected-clusters: 511
+            cm-auth-mode: 'migration'
 
           # Currently, ipsec requires to synchronously regenerate the host
           # endpoint to ensure ordering (#25735). Given that this is a blocking
@@ -128,6 +130,7 @@ jobs:
             kube-proxy: 'iptables'
             external-kvstore: false
             max-connected-clusters: 511
+            cm-auth-mode: 'cluster'
 
     steps:
       - name: Collect Workflow Telemetry
@@ -136,7 +139,7 @@ jobs:
           comment_on_pr: false
 
       - name: Checkout context ref (trusted)
-        uses: actions/checkout@44c2b7a8a4ea60a981eaca3cf939b5f4305c123b # v4.1.5
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ inputs.context-ref || github.sha }}
           persist-credentials: false
@@ -187,7 +190,9 @@ jobs:
             --set=clustermesh.apiserver.readinessProbe.periodSeconds=1 \
             --set=clustermesh.apiserver.kvstoremesh.readinessProbe.periodSeconds=1 \
             --set=clustermesh.apiserver.updateStrategy.rollingUpdate.maxSurge=1 `# Use surge update strategy to enable clients to failover` \
-            --set=clustermesh.apiserver.updateStrategy.rollingUpdate.maxUnavailable=0"
+            --set=clustermesh.apiserver.updateStrategy.rollingUpdate.maxUnavailable=0 \
+            --set=clustermesh.apiserver.tls.authMode=${{ matrix.cm-auth-mode }} \
+          "
 
           # Run only a limited subset of tests to reduce the amount of time
           # required. The full suite is run in conformance-clustermesh.
@@ -217,7 +222,7 @@ jobs:
           echo "connectivity_test_defaults=${CONNECTIVITY_TEST_DEFAULTS}" >> $GITHUB_OUTPUT
 
       - name: Install Cilium CLI
-        uses: cilium/cilium-cli@13cf0683b2662c27c691f4330c2ac0f48b429ce5 # v0.16.7
+        uses: cilium/cilium-cli@6977c4a640ad45da3a95eb12054497f2bdd22c48 # v0.16.19
         with:
           repository: ${{ env.CILIUM_CLI_RELEASE_REPO }}
           release-version: ${{ env.CILIUM_CLI_VERSION }}
@@ -349,7 +354,7 @@ jobs:
       # Warning: since this is a privileged workflow, subsequent workflow job
       # steps must take care not to execute untrusted code.
       - name: Checkout pull request branch (NOT TRUSTED)
-        uses: actions/checkout@44c2b7a8a4ea60a981eaca3cf939b5f4305c123b # v4.1.5
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ steps.newest-vars.outputs.sha }}
           persist-credentials: false
@@ -358,7 +363,7 @@ jobs:
             install/kubernetes/cilium
 
       - name: Checkout ${{ steps.vars.outputs.downgrade_version }} branch
-        uses: actions/checkout@44c2b7a8a4ea60a981eaca3cf939b5f4305c123b # v4.1.5
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ steps.vars.outputs.downgrade_version }}
           persist-credentials: false
@@ -426,8 +431,8 @@ jobs:
 
       - name: Wait for cluster mesh status to be ready
         run: |
-          cilium --context ${{ env.contextName1 }} status --wait
-          cilium --context ${{ env.contextName2 }} status --wait
+          cilium --context ${{ env.contextName1 }} status --wait --wait-duration=10m
+          cilium --context ${{ env.contextName2 }} status --wait --wait-duration=10m
           cilium --context ${{ env.contextName1 }} clustermesh status --wait --wait-duration=5m
           cilium --context ${{ env.contextName2 }} clustermesh status --wait --wait-duration=5m
 
@@ -469,6 +474,13 @@ jobs:
           cilium --context ${{ env.contextName1 }} clustermesh status --wait --wait-duration=5m
           cilium --context ${{ env.contextName2 }} clustermesh status --wait --wait-duration=5m
 
+      - name: Set cilium connectivity test namespace
+        id: cilium-cli
+        run: |
+          NAMESPACE=$(kubectl get namespace -l "app.kubernetes.io/name=cilium-cli" -o name | sort | cut -d / -f 2 | head -1)
+          echo namespace="$NAMESPACE" >> $GITHUB_OUTPUT
+          ${{ steps.cilium-cli.outputs.namespace }}
+
       - name: Write the Service manifest for testing failover
         if: ${{ !matrix.external-kvstore }}
         run: |
@@ -482,7 +494,7 @@ jobs:
               kind: echo
               context: failover
             name: echo-other-node-failover
-            namespace: cilium-test
+            namespace: ${{ steps.cilium-cli.outputs.namespace }}
           spec:
             ipFamilies:
             - IPv4
@@ -511,7 +523,7 @@ jobs:
           kubectl --context ${{ env.contextName2 }} apply -f echo-failover.yaml
 
           echo "Testing client connection to global Service"
-          kubectl --context ${{ env.contextName1 }} -n cilium-test exec deploy/client -i -- curl -s -v --connect-timeout 2 --max-time 5 --retry-max-time 60 --retry-all-errors --retry 10 --output /dev/null --fail echo-other-node-failover
+          kubectl --context ${{ env.contextName1 }} -n ${{ steps.cilium-cli.outputs.namespace }} exec deploy/client -i -- curl -s -v --connect-timeout 2 --max-time 5 --retry-max-time 60 --retry-all-errors --retry 10 --output /dev/null --fail echo-other-node-failover
 
           # Clean up the service so that it can be re-deployed in subsequent steps
           kubectl --context ${{ env.contextName1 }} delete -f echo-failover.yaml
@@ -531,8 +543,8 @@ jobs:
       - name: Wait for cluster mesh status to be ready
         if: ${{ !matrix.external-kvstore }}
         run: |
-          cilium --context ${{ env.contextName1 }} status --wait
-          cilium --context ${{ env.contextName2 }} status --wait
+          cilium --context ${{ env.contextName1 }} status --wait --wait-duration=10m
+          cilium --context ${{ env.contextName2 }} status --wait --wait-duration=10m
           cilium --context ${{ env.contextName1 }} clustermesh status --wait --wait-duration=5m
           cilium --context ${{ env.contextName2 }} clustermesh status --wait --wait-duration=5m
 
@@ -548,7 +560,7 @@ jobs:
           kubectl --context ${{ env.contextName2 }} apply -f echo-failover.yaml
 
           echo "Testing client connection to global Service"
-          kubectl --context ${{ env.contextName1 }} -n cilium-test exec deploy/client -i -- curl -s -v --connect-timeout 2 --max-time 5 --retry-max-time 60 --retry-all-errors --retry 10 --output /dev/null --fail echo-other-node-failover
+          kubectl --context ${{ env.contextName1 }} -n ${{ steps.cilium-cli.outputs.namespace }} exec deploy/client -i -- curl -s -v --connect-timeout 2 --max-time 5 --retry-max-time 60 --retry-all-errors --retry 10 --output /dev/null --fail echo-other-node-failover
 
           # Clean up the service so that it can be re-deployed in subsequent steps
           kubectl --context ${{ env.contextName1 }} delete -f echo-failover.yaml
@@ -556,11 +568,11 @@ jobs:
 
       - name: Gather additional troubleshooting information
         run: |
-          kubectl --context ${{ env.contextName1 }} get po -n cilium-test -o wide -l kind=test-conn-disrupt
-          kubectl --context ${{ env.contextName2 }} get po -n cilium-test -o wide -l kind=test-conn-disrupt
-          kubectl --context ${{ env.contextName1 }} logs -n cilium-test -l kind=test-conn-disrupt --prefix --timestamps
-          kubectl --context ${{ env.contextName2 }} logs -n cilium-test -l kind=test-conn-disrupt --prefix --timestamps
-          kubectl --context ${{ env.contextName2 }} logs -n cilium-test -l kind=test-conn-disrupt --prefix --previous --ignore-errors --timestamps
+          kubectl --context ${{ env.contextName1 }} get po -n ${{ steps.cilium-cli.outputs.namespace }} -o wide -l kind=test-conn-disrupt
+          kubectl --context ${{ env.contextName2 }} get po -n ${{ steps.cilium-cli.outputs.namespace }} -o wide -l kind=test-conn-disrupt
+          kubectl --context ${{ env.contextName1 }} logs -n ${{ steps.cilium-cli.outputs.namespace }} -l kind=test-conn-disrupt --prefix --timestamps
+          kubectl --context ${{ env.contextName2 }} logs -n ${{ steps.cilium-cli.outputs.namespace }} -l kind=test-conn-disrupt --prefix --timestamps
+          kubectl --context ${{ env.contextName2 }} logs -n ${{ steps.cilium-cli.outputs.namespace }} -l kind=test-conn-disrupt --prefix --previous --ignore-errors --timestamps
 
       - name: Run connectivity test - post-upgrade (${{ join(matrix.*, ', ') }})
         run: |
@@ -610,18 +622,18 @@ jobs:
 
       - name: Wait for cluster mesh status to be ready
         run: |
-          cilium --context ${{ env.contextName1 }} status --wait
-          cilium --context ${{ env.contextName2 }} status --wait
+          cilium --context ${{ env.contextName1 }} status --wait --wait-duration=10m
+          cilium --context ${{ env.contextName2 }} status --wait --wait-duration=10m
           cilium --context ${{ env.contextName1 }} clustermesh status --wait --wait-duration=5m
           cilium --context ${{ env.contextName2 }} clustermesh status --wait --wait-duration=5m
 
       - name: Gather additional troubleshooting information
         run: |
-          kubectl --context ${{ env.contextName1 }} get po -n cilium-test -o wide -l kind=test-conn-disrupt
-          kubectl --context ${{ env.contextName2 }} get po -n cilium-test -o wide -l kind=test-conn-disrupt
-          kubectl --context ${{ env.contextName1 }} logs -n cilium-test -l kind=test-conn-disrupt --prefix --timestamps
-          kubectl --context ${{ env.contextName2 }} logs -n cilium-test -l kind=test-conn-disrupt --prefix --timestamps
-          kubectl --context ${{ env.contextName2 }} logs -n cilium-test -l kind=test-conn-disrupt --prefix --previous --ignore-errors --timestamps
+          kubectl --context ${{ env.contextName1 }} get po -n ${{ steps.cilium-cli.outputs.namespace }} -o wide -l kind=test-conn-disrupt
+          kubectl --context ${{ env.contextName2 }} get po -n ${{ steps.cilium-cli.outputs.namespace }} -o wide -l kind=test-conn-disrupt
+          kubectl --context ${{ env.contextName1 }} logs -n ${{ steps.cilium-cli.outputs.namespace }} -l kind=test-conn-disrupt --prefix --timestamps
+          kubectl --context ${{ env.contextName2 }} logs -n ${{ steps.cilium-cli.outputs.namespace }} -l kind=test-conn-disrupt --prefix --timestamps
+          kubectl --context ${{ env.contextName2 }} logs -n ${{ steps.cilium-cli.outputs.namespace }} -l kind=test-conn-disrupt --prefix --previous --ignore-errors --timestamps
 
       - name: Run connectivity test - stress-test (${{ join(matrix.*, ', ') }})
         run: |
@@ -657,18 +669,18 @@ jobs:
 
       - name: Wait for cluster mesh status to be ready
         run: |
-          cilium --context ${{ env.contextName1 }} status --wait
-          cilium --context ${{ env.contextName2 }} status --wait
+          cilium --context ${{ env.contextName1 }} status --wait --wait-duration=10m
+          cilium --context ${{ env.contextName2 }} status --wait --wait-duration=10m
           cilium --context ${{ env.contextName1 }} clustermesh status --wait --wait-duration=5m
           cilium --context ${{ env.contextName2 }} clustermesh status --wait --wait-duration=5m
 
       - name: Gather additional troubleshooting information
         run: |
-          kubectl --context ${{ env.contextName1 }} get po -n cilium-test -o wide -l kind=test-conn-disrupt
-          kubectl --context ${{ env.contextName2 }} get po -n cilium-test -o wide -l kind=test-conn-disrupt
-          kubectl --context ${{ env.contextName1 }} logs -n cilium-test -l kind=test-conn-disrupt --prefix --timestamps
-          kubectl --context ${{ env.contextName2 }} logs -n cilium-test -l kind=test-conn-disrupt --prefix --timestamps
-          kubectl --context ${{ env.contextName2 }} logs -n cilium-test -l kind=test-conn-disrupt --prefix --previous --ignore-errors --timestamps
+          kubectl --context ${{ env.contextName1 }} get po -n ${{ steps.cilium-cli.outputs.namespace }} -o wide -l kind=test-conn-disrupt
+          kubectl --context ${{ env.contextName2 }} get po -n ${{ steps.cilium-cli.outputs.namespace }} -o wide -l kind=test-conn-disrupt
+          kubectl --context ${{ env.contextName1 }} logs -n ${{ steps.cilium-cli.outputs.namespace }} -l kind=test-conn-disrupt --prefix --timestamps
+          kubectl --context ${{ env.contextName2 }} logs -n ${{ steps.cilium-cli.outputs.namespace }} -l kind=test-conn-disrupt --prefix --timestamps
+          kubectl --context ${{ env.contextName2 }} logs -n ${{ steps.cilium-cli.outputs.namespace }} -l kind=test-conn-disrupt --prefix --previous --ignore-errors --timestamps
 
       - name: Run connectivity test - post-downgrade (${{ join(matrix.*, ', ') }})
         run: |
@@ -707,14 +719,14 @@ jobs:
 
       - name: Upload artifacts
         if: ${{ !success() }}
-        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: cilium-sysdumps-${{ matrix.name }}
           path: cilium-sysdump-*.zip
 
       - name: Upload JUnits [junit]
         if: ${{ always() }}
-        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: cilium-junits-${{ matrix.name }}
           path: cilium-junits/*.xml
@@ -733,7 +745,7 @@ jobs:
     steps:
       - name: Merge Sysdumps
         if: ${{ needs.upgrade-and-downgrade.result == 'failure' }}
-        uses: actions/upload-artifact/merge@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        uses: actions/upload-artifact/merge@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: cilium-sysdumps
           pattern: cilium-sysdumps-*
@@ -741,7 +753,7 @@ jobs:
           delete-merged: true
         continue-on-error: true
       - name: Merge JUnits
-        uses: actions/upload-artifact/merge@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        uses: actions/upload-artifact/merge@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: cilium-junits
           pattern: cilium-junits-*
@@ -749,7 +761,7 @@ jobs:
           delete-merged: true
 
   commit-status-final:
-    if: ${{ always() && github.event_name != 'push' }}
+    if: ${{ always() }}
     name: Commit Status Final
     needs: upgrade-and-downgrade
     runs-on: ubuntu-latest

@@ -20,23 +20,27 @@ var (
 )
 
 type TestEndpoint struct {
-	Id       uint64
-	Identity *identity.Identity
-	Opts     *option.IntOptions
-	MAC      mac.MAC
-	IPv6     netip.Addr
-	isHost   bool
-	State    string
+	Id          uint64
+	Identity    *identity.Identity
+	Opts        *option.IntOptions
+	MAC         mac.MAC
+	IfIndex     int
+	IPv6        netip.Addr
+	isHost      bool
+	State       string
+	NetNsCookie uint64
 }
 
 func NewTestEndpoint() TestEndpoint {
 	opts := option.NewIntOptions(&option.OptionLibrary{})
 	opts.SetBool("TEST_OPTION", true)
 	return TestEndpoint{
-		Id:       42,
-		Identity: defaultIdentity,
-		MAC:      mac.MAC([]byte{0x02, 0x00, 0x60, 0x0D, 0xF0, 0x0D}),
-		Opts:     opts,
+		Id:          42,
+		Identity:    defaultIdentity,
+		MAC:         mac.MAC([]byte{0x02, 0x00, 0x60, 0x0D, 0xF0, 0x0D}),
+		IfIndex:     0,
+		Opts:        opts,
+		NetNsCookie: 0,
 	}
 }
 
@@ -47,6 +51,7 @@ func NewTestHostEndpoint() TestEndpoint {
 		Id:       65535,
 		Identity: hostIdentity,
 		MAC:      mac.MAC([]byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06}),
+		IfIndex:  0,
 		Opts:     opts,
 		isHost:   true,
 	}
@@ -63,8 +68,10 @@ func (e *TestEndpoint) GetID() uint64                               { return e.I
 func (e *TestEndpoint) StringID() string                            { return "42" }
 func (e *TestEndpoint) GetIdentity() identity.NumericIdentity       { return e.Identity.ID }
 func (e *TestEndpoint) GetIdentityLocked() identity.NumericIdentity { return e.Identity.ID }
+func (e *TestEndpoint) GetEndpointNetNsCookie() uint64              { return e.NetNsCookie }
 func (e *TestEndpoint) GetSecurityIdentity() *identity.Identity     { return e.Identity }
 func (e *TestEndpoint) GetNodeMAC() mac.MAC                         { return e.MAC }
+func (e *TestEndpoint) GetIfIndex() int                             { return e.IfIndex }
 func (e *TestEndpoint) GetOptions() *option.IntOptions              { return e.Opts }
 func (e *TestEndpoint) IsHost() bool                                { return e.isHost }
 

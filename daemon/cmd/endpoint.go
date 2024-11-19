@@ -458,6 +458,9 @@ func (d *Daemon) createEndpoint(ctx context.Context, owner regeneration.Owner, e
 				err = errors.Join(err, err2)
 			} else {
 				pod = newPod
+				// Clear the error so the code can proceed below as we've
+				// succeeded here.
+				err = nil
 			}
 		}
 
@@ -518,7 +521,7 @@ func (d *Daemon) createEndpoint(ctx context.Context, owner regeneration.Owner, e
 	}
 
 	// e.ID assigned here
-	err = d.endpointManager.AddEndpoint(owner, ep, "Create endpoint from API PUT")
+	err = d.endpointManager.AddEndpoint(owner, ep)
 	if err != nil {
 		return d.errorDuringCreation(ep, fmt.Errorf("unable to insert endpoint into manager: %w", err))
 	}
@@ -549,7 +552,7 @@ func (d *Daemon) createEndpoint(ctx context.Context, owner regeneration.Owner, e
 		regenMetadata := &regeneration.ExternalRegenerationMetadata{
 			Reason:            "Initial build on endpoint creation",
 			ParentContext:     ctx,
-			RegenerationLevel: regeneration.RegenerateWithDatapathRewrite,
+			RegenerationLevel: regeneration.RegenerateWithDatapath,
 		}
 		build, err := ep.SetRegenerateStateIfAlive(regenMetadata)
 		if err != nil {
@@ -735,7 +738,7 @@ func patchEndpointIDHandler(d *Daemon, params PatchEndpointIDParams) middleware.
 	if reason != "" {
 		regenMetadata := &regeneration.ExternalRegenerationMetadata{
 			Reason:            reason,
-			RegenerationLevel: regeneration.RegenerateWithDatapathRewrite,
+			RegenerationLevel: regeneration.RegenerateWithDatapath,
 		}
 		if !<-ep.Regenerate(regenMetadata) {
 			err := api.Error(PatchEndpointIDFailedCode,
@@ -750,19 +753,23 @@ func patchEndpointIDHandler(d *Daemon, params PatchEndpointIDParams) middleware.
 	return NewPatchEndpointIDOK()
 }
 
-func (d *Daemon) deleteEndpoint(ep *endpoint.Endpoint) int {
+func (d *Daemon) deleteEndpointRelease(ep *endpoint.Endpoint, noIPRelease bool) int {
 	// Cancel any ongoing endpoint creation
 	d.endpointCreations.CancelCreateRequest(ep)
 
 	scopedLog := log.WithField(logfields.EndpointID, ep.ID)
 	errs := d.deleteEndpointQuiet(ep, endpoint.DeleteConfig{
-		// If the IP is managed by an external IPAM, it does not need to be released
-		NoIPRelease: ep.DatapathConfiguration.ExternalIpam,
+		NoIPRelease: noIPRelease,
 	})
 	for _, err := range errs {
 		scopedLog.WithError(err).Warn("Ignoring error while deleting endpoint")
 	}
 	return len(errs)
+}
+
+func (d *Daemon) deleteEndpoint(ep *endpoint.Endpoint) int {
+	// If the IP is managed by an external IPAM, it does not need to be released
+	return d.deleteEndpointRelease(ep, ep.DatapathConfiguration.ExternalIpam)
 }
 
 // deleteEndpointQuiet sets the endpoint into disconnecting state and removes

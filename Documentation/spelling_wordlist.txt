@@ -36,9 +36,9 @@ Dockerfile
 Dockerfiles
 Donenfeld
 ECMP
+EKS
 ENI
 Efx
-EKS
 Engleder
 FIt
 Fastabend
@@ -48,6 +48,7 @@ Fsnotify
 GCP
 GKE
 Gartrell
+GatewayClass
 Gbit
 GiB
 Gospodarek
@@ -183,6 +184,7 @@ bcc
 behaviour
 benchmarking
 bgp
+blackholing
 blockedConfigOverrides
 bnxt
 bookinfo
@@ -273,6 +275,7 @@ decapsulation
 decrypt
 decrypted
 deepcopy
+defaultLBServiceIPAM
 deletetopic
 demux
 denylist
@@ -295,6 +298,7 @@ eBGP
 eBPF
 eXpress
 ebpf
+edts
 effectful
 egressing
 elfutils
@@ -311,6 +315,8 @@ etcd
 eth
 ethernet
 ethtool
+existingSecret
+expirations
 extTrafficPolicy
 extern
 externalIPs
@@ -427,6 +433,9 @@ jsgt
 jsle
 jslt
 json
+k8sServiceHost
+k8sServiceLookupConfigMapName
+k8sServiceLookupNamespace
 kTLS
 kafka
 kallsyms
@@ -539,6 +548,8 @@ netdevices
 netdevsim
 netfilter
 netfront
+netkit
+netlink
 netns
 netperf
 netsec
@@ -564,6 +575,7 @@ openapi
 openssl
 originatingTLS
 os
+oseq
 otx
 pahole
 parsable
@@ -599,6 +611,7 @@ prerequirement
 prestop
 printf
 priori
+proc
 profiler
 programmability
 prometheus
@@ -622,6 +635,7 @@ rebased
 rebasing
 recompiles
 reconfigurations
+reconnections
 recv
 regenerations
 regexes
@@ -631,7 +645,10 @@ reparsing
 repo
 repos
 reproducibility
+reqid
 requireIPv
+resizable
+resync
 retpoline
 retransmission
 retransmissions
@@ -651,6 +668,7 @@ secretName
 secretsNamespace
 selftest
 selftests
+serverinfo
 serviceAccount
 serviceMonitor
 setrlimit
@@ -727,6 +745,7 @@ tracepoints
 tracestate
 transpiling
 tsne
+tunings
 tunnelProtocol
 ubuntu
 udp
@@ -784,6 +803,7 @@ webservice
 whitespace
 wildcarded
 workqueue
+workstream
 www
 xDS
 xdp

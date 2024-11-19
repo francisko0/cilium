@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/cilium/cilium/pkg/datapath/linux/probes"
+	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/inctimer"
@@ -71,6 +72,8 @@ var DevicesControllerCell = cell.Module(
 
 func (c DevicesConfig) Flags(flags *pflag.FlagSet) {
 	flags.StringSlice(option.Devices, []string{}, "List of devices facing cluster/external network (used for BPF NodePort, BPF masquerading and host firewall); supports '+' as wildcard in device name, e.g. 'eth+'")
+
+	flags.Bool(option.ForceDeviceDetection, false, "Forces the auto-detection of devices, even if specific devices are explicitly listed")
 }
 
 var (
@@ -95,6 +98,9 @@ type DevicesConfig struct {
 	// If empty the devices are auto-detected according to rules defined
 	// by isSelectedDevice().
 	Devices []string
+	// ForceDeviceDetection forces the auto-detection of devices,
+	// even if user-specific devices are explicitly listed.
+	ForceDeviceDetection bool
 }
 
 type devicesControllerParams struct {
@@ -114,9 +120,10 @@ type devicesController struct {
 	params devicesControllerParams
 	log    *slog.Logger
 
-	initialized    chan struct{}
-	filter         deviceFilter
-	l3DevSupported bool
+	initialized          chan struct{}
+	filter               deviceFilter
+	enforceAutoDetection bool
+	l3DevSupported       bool
 
 	// deadLinkIndexes tracks the set of links that have been deleted. This is needed
 	// to avoid processing route or address updates after a link delete as they may
@@ -128,11 +135,12 @@ type devicesController struct {
 
 func newDevicesController(lc cell.Lifecycle, p devicesControllerParams) (*devicesController, statedb.Table[*tables.Device], statedb.Table[*tables.Route]) {
 	dc := &devicesController{
-		params:          p,
-		initialized:     make(chan struct{}),
-		filter:          deviceFilter(p.Config.Devices),
-		log:             p.Log,
-		deadLinkIndexes: sets.New[int](),
+		params:               p,
+		initialized:          make(chan struct{}),
+		filter:               deviceFilter(p.Config.Devices),
+		enforceAutoDetection: p.Config.ForceDeviceDetection,
+		log:                  p.Log,
+		deadLinkIndexes:      sets.New[int](),
 	}
 	lc.Append(dc)
 	return dc, p.DeviceTable, p.RouteTable
@@ -195,6 +203,13 @@ func (dc *devicesController) subscribeAndProcess(ctx context.Context) {
 	// It cancels the context to unsubscribe from netlink updates
 	// which stops the processing.
 	errorCallback := func(err error) {
+		if ctx.Err() != nil {
+			// The netlink unsubscribe can lead to errorCallback being called after
+			// context cancellation with a "receive called on closed socket".
+			// Thus ignore the error if the context was cancelled.
+			return
+		}
+
 		dc.log.Warn("Netlink error received, restarting", logfields.Error, err)
 
 		// Cancel the context to stop the subscriptions.
@@ -536,12 +551,15 @@ func (dc *devicesController) isSelectedDevice(d *tables.Device, txn statedb.Writ
 	}
 
 	// If user specified devices or wildcards, then skip the device if it doesn't match.
-	// If the device does match, then skip further checks.
+	// If the device does match and user not requested auto detection, then skip further checks.
+	// If the device does match and user requested auto detection, then continue to further checks.
 	if dc.filter.nonEmpty() {
 		if dc.filter.match(d.Name) {
 			return true, ""
 		}
-		return false, fmt.Sprintf("not matching user filter %v", dc.filter)
+		if !dc.enforceAutoDetection {
+			return false, fmt.Sprintf("not matching user filter %v", dc.filter)
+		}
 	}
 
 	// Skip devices that have an excluded interface flag set.
@@ -660,7 +678,7 @@ func makeNetlinkFuncs() (*netlinkFuncs, error) {
 	return &netlinkFuncs{
 		RouteSubscribe: func(ch chan<- netlink.RouteUpdate, done <-chan struct{}, errorCallback func(error)) error {
 			h := vns.NsHandle(cur.FD())
-			return netlink.RouteSubscribeWithOptions(ch, done,
+			return safenetlink.RouteSubscribeWithOptions(ch, done,
 				netlink.RouteSubscribeOptions{
 					ListExisting:  false,
 					ErrorCallback: errorCallback,
@@ -678,7 +696,7 @@ func makeNetlinkFuncs() (*netlinkFuncs, error) {
 		},
 		LinkSubscribe: func(ch chan<- netlink.LinkUpdate, done <-chan struct{}, errorCallback func(error)) error {
 			h := vns.NsHandle(cur.FD())
-			return netlink.LinkSubscribeWithOptions(ch, done,
+			return safenetlink.LinkSubscribeWithOptions(ch, done,
 				netlink.LinkSubscribeOptions{
 					ListExisting:  false,
 					ErrorCallback: errorCallback,

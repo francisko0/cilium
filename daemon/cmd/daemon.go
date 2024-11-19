@@ -26,34 +26,32 @@ import (
 	"github.com/cilium/cilium/daemon/cmd/cni"
 	agentK8s "github.com/cilium/cilium/daemon/k8s"
 	"github.com/cilium/cilium/pkg/auth"
-	"github.com/cilium/cilium/pkg/bgp/speaker"
 	"github.com/cilium/cilium/pkg/cgroups/manager"
 	"github.com/cilium/cilium/pkg/clustermesh"
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/controller"
 	"github.com/cilium/cilium/pkg/datapath/link"
 	linuxdatapath "github.com/cilium/cilium/pkg/datapath/linux"
 	"github.com/cilium/cilium/pkg/datapath/linux/bigtcp"
 	"github.com/cilium/cilium/pkg/datapath/linux/probes"
 	linuxrouting "github.com/cilium/cilium/pkg/datapath/linux/routing"
+	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
 	datapathOption "github.com/cilium/cilium/pkg/datapath/option"
 	datapathTables "github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/datapath/tunnel"
 	datapath "github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/debug"
 	"github.com/cilium/cilium/pkg/defaults"
-	"github.com/cilium/cilium/pkg/egressgateway"
 	"github.com/cilium/cilium/pkg/endpoint"
 	"github.com/cilium/cilium/pkg/endpoint/regeneration"
 	"github.com/cilium/cilium/pkg/endpointmanager"
 	"github.com/cilium/cilium/pkg/envoy"
 	"github.com/cilium/cilium/pkg/eventqueue"
 	"github.com/cilium/cilium/pkg/fqdn"
-	"github.com/cilium/cilium/pkg/healthv2/types"
 	"github.com/cilium/cilium/pkg/hubble/observer"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/identity/identitymanager"
 	"github.com/cilium/cilium/pkg/ipam"
-	ipamMetadata "github.com/cilium/cilium/pkg/ipam/metadata"
 	ipamOption "github.com/cilium/cilium/pkg/ipam/option"
 	"github.com/cilium/cilium/pkg/ipcache"
 	"github.com/cilium/cilium/pkg/k8s"
@@ -81,7 +79,6 @@ import (
 	"github.com/cilium/cilium/pkg/proxy"
 	"github.com/cilium/cilium/pkg/rate"
 	"github.com/cilium/cilium/pkg/recorder"
-	"github.com/cilium/cilium/pkg/redirectpolicy"
 	"github.com/cilium/cilium/pkg/resiliency"
 	"github.com/cilium/cilium/pkg/service"
 	serviceStore "github.com/cilium/cilium/pkg/service/store"
@@ -111,8 +108,6 @@ type Daemon struct {
 	svc              service.ServiceManager
 	rec              *recorder.Recorder
 	policy           *policy.Repository
-	policyUpdater    *policy.Updater
-	preFilter        datapath.PreFilter
 
 	statusCollectMutex lock.RWMutex
 	statusResponse     models.StatusResponse
@@ -121,9 +116,8 @@ type Daemon struct {
 	monitorAgent monitoragent.Agent
 	ciliumHealth *health.CiliumHealth
 
-	deviceManager *linuxdatapath.DeviceManager
-	devices       statedb.Table[*datapathTables.Device]
-	nodeAddrs     statedb.Table[datapathTables.NodeAddress]
+	devices   statedb.Table[*datapathTables.Device]
+	nodeAddrs statedb.Table[datapathTables.NodeAddress]
 
 	// dnsNameManager tracks which api.FQDNSelector are present in policy which
 	// apply to locally running endpoints.
@@ -133,6 +127,7 @@ type Daemon struct {
 	// programs.
 	compilationLock datapath.CompilationLock
 
+	clusterInfo cmtypes.ClusterInfo
 	clustermesh *clustermesh.ClusterMesh
 
 	mtuConfig mtu.MTU
@@ -158,7 +153,8 @@ type Daemon struct {
 
 	ipcache *ipcache.IPCache
 
-	k8sWatcher *watchers.K8sWatcher
+	k8sWatcher  *watchers.K8sWatcher
+	k8sSvcCache *k8s.ServiceCache
 
 	// endpointMetadataFetcher knows how to fetch Kubernetes metadata for endpoints.
 	endpointMetadataFetcher endpointMetadataFetcher
@@ -174,15 +170,7 @@ type Daemon struct {
 	// creation events
 	endpointCreations *endpointCreationManager
 
-	lrpManager *redirectpolicy.Manager
-
-	bgpSpeaker *speaker.MetalLBSpeaker
-
-	egressGatewayManager *egressgateway.Manager
-
-	cgroupManager *manager.CgroupManager
-
-	ipamMetadata *ipamMetadata.Manager
+	cgroupManager manager.CGroupManager
 
 	apiLimiterSet *rate.APILimiterSet
 
@@ -207,8 +195,6 @@ type Daemon struct {
 	// read-only map of all the hive settings
 	settings cellSettings
 
-	healthV2Provider types.Provider
-
 	// Tunnel-related configuration
 	tunnelConfig tunnel.Config
 	bwManager    datapath.BandwidthManager
@@ -217,16 +203,6 @@ type Daemon struct {
 // GetPolicyRepository returns the policy repository of the daemon
 func (d *Daemon) GetPolicyRepository() *policy.Repository {
 	return d.policy
-}
-
-// DebugEnabled returns if debug mode is enabled.
-func (d *Daemon) DebugEnabled() bool {
-	return option.Config.Opts.IsEnabled(option.Debug)
-}
-
-// GetOptions returns the datapath configuration options of the daemon.
-func (d *Daemon) GetOptions() *option.IntOptions {
-	return option.Config.Opts
 }
 
 // GetCompilationLock returns the mutex responsible for synchronizing compilation
@@ -264,7 +240,7 @@ func (d *Daemon) init() error {
 // `cilium_host` interface is the given restored IP. If the given IP is nil,
 // then it attempts to clear all IPs from the interface.
 func removeOldRouterState(ipv6 bool, restoredIP net.IP) error {
-	l, err := netlink.LinkByName(defaults.HostDevice)
+	l, err := safenetlink.LinkByName(defaults.HostDevice)
 	if errors.As(err, &netlink.LinkNotFoundError{}) {
 		// There's no old state remove as the host device doesn't exist.
 		// This is always the case when the agent is started for the first time.
@@ -278,7 +254,7 @@ func removeOldRouterState(ipv6 bool, restoredIP net.IP) error {
 	if ipv6 {
 		family = netlink.FAMILY_V6
 	}
-	addrs, err := netlink.AddrList(l, family)
+	addrs, err := safenetlink.AddrList(l, family)
 	if err != nil {
 		return resiliency.Retryable(err)
 	}
@@ -409,6 +385,7 @@ func newDaemon(ctx context.Context, cleaner *daemonCleanup, params *daemonParams
 
 	identity.IterateReservedIdentities(func(_ identity.NumericIdentity, _ *identity.Identity) {
 		metrics.Identity.WithLabelValues(identity.ReservedIdentityType).Inc()
+		metrics.IdentityLabelSources.WithLabelValues(labels.LabelSourceReserved).Inc()
 	})
 
 	d := Daemon{
@@ -419,7 +396,6 @@ func newDaemon(ctx context.Context, cleaner *daemonCleanup, params *daemonParams
 		compilationLock:   params.CompilationLock,
 		mtuConfig:         params.MTU,
 		datapath:          params.Datapath,
-		deviceManager:     params.DeviceManager,
 		devices:           params.Devices,
 		nodeAddrs:         params.NodeAddrs,
 		nodeDiscovery:     params.NodeDiscovery,
@@ -430,43 +406,38 @@ func newDaemon(ctx context.Context, cleaner *daemonCleanup, params *daemonParams
 		// **NOTE** The global identity allocator is not yet initialized here; that
 		// happens below via InitIdentityAllocator(). Only the local identity
 		// allocator is initialized here.
-		identityAllocator:    params.IdentityAllocator,
-		ipcache:              params.IPCache,
-		policy:               params.Policy,
-		policyUpdater:        params.PolicyUpdater,
-		egressGatewayManager: params.EgressGatewayManager,
-		ipamMetadata:         params.IPAMMetadataManager,
-		cniConfigManager:     params.CNIConfigManager,
-		clustermesh:          params.ClusterMesh,
-		monitorAgent:         params.MonitorAgent,
-		svc:                  params.ServiceManager,
-		l7Proxy:              params.L7Proxy,
-		envoyXdsServer:       params.EnvoyXdsServer,
-		authManager:          params.AuthManager,
-		settings:             params.Settings,
-		healthV2Provider:     params.HealthV2Provider,
-		bigTCPConfig:         params.BigTCPConfig,
-		tunnelConfig:         params.TunnelConfig,
-		bwManager:            params.BandwidthManager,
-		lrpManager:           params.LRPManager,
-		preFilter:            params.Prefilter,
+		identityAllocator: params.IdentityAllocator,
+		ipcache:           params.IPCache,
+		policy:            params.Policy,
+		cniConfigManager:  params.CNIConfigManager,
+		clusterInfo:       params.ClusterInfo,
+		clustermesh:       params.ClusterMesh,
+		monitorAgent:      params.MonitorAgent,
+		svc:               params.ServiceManager,
+		l7Proxy:           params.L7Proxy,
+		envoyXdsServer:    params.EnvoyXdsServer,
+		authManager:       params.AuthManager,
+		settings:          params.Settings,
+		bigTCPConfig:      params.BigTCPConfig,
+		tunnelConfig:      params.TunnelConfig,
+		bwManager:         params.BandwidthManager,
+		cgroupManager:     params.CGroupManager,
+		endpointManager:   params.EndpointManager,
+		k8sWatcher:        params.K8sWatcher,
+		k8sSvcCache:       params.K8sSvcCache,
+		rec:               params.Recorder,
+		ipam:              params.IPAM,
 	}
 
 	d.configModifyQueue = eventqueue.NewEventQueueBuffered("config-modify-queue", ConfigModifyQueueSize)
 	d.configModifyQueue.Run()
-
-	d.rec, err = recorder.NewRecorder(d.ctx, params.Datapath.Loader())
-	if err != nil {
-		log.WithError(err).Error("error while initializing BPF pcap recorder")
-		return nil, nil, fmt.Errorf("error while initializing BPF pcap recorder: %w", err)
-	}
 
 	// Collect CIDR identities from the "old" bpf ipcache and restore them
 	// in to the metadata layer.
 	if option.Config.RestoreState && !option.Config.DryMode {
 		// this *must* be called before initMaps(), which will "hide"
 		// the "old" ipcache.
-		err := d.restoreIPCache()
+		err := d.restoreLocalIdentities()
 		if err != nil {
 			log.WithError(err).Warn("Failed to restore existing identities from the previous ipcache. This may cause policy interruptions during restart.")
 		}
@@ -474,61 +445,6 @@ func newDaemon(ctx context.Context, cleaner *daemonCleanup, params *daemonParams
 
 	if err := d.initPolicy(); err != nil {
 		return nil, nil, fmt.Errorf("error while initializing policy subsystem: %w", err)
-	}
-
-	d.endpointManager = params.EndpointManager
-
-	if option.Config.BGPAnnounceLBIP || option.Config.BGPAnnouncePodCIDR {
-		log.WithField("url", "https://github.com/cilium/cilium/issues/22246").
-			Warn("You are using the legacy BGP feature, which will only receive security updates and bugfixes. " +
-				"It is recommended to migrate to the BGP Control Plane feature if possible, which has better support.")
-
-		d.bgpSpeaker, err = speaker.New(ctx, params.Clientset, speaker.Opts{
-			LoadBalancerIP: option.Config.BGPAnnounceLBIP,
-			PodCIDR:        option.Config.BGPAnnouncePodCIDR,
-		})
-		if err != nil {
-			log.WithError(err).Error("Error creating new BGP speaker")
-			return nil, nil, err
-		}
-	}
-
-	d.cgroupManager = manager.NewCgroupManager()
-
-	d.k8sWatcher = watchers.NewK8sWatcher(
-		params.Clientset,
-		params.K8sResourceSynced,
-		params.K8sAPIGroups,
-		d.endpointManager,
-		params.NodeManager,
-		&d,
-		d.policy,
-		d.svc,
-		d.lrpManager,
-		d.bgpSpeaker,
-		option.Config,
-		d.ipcache,
-		d.cgroupManager,
-		params.Resources,
-		params.ServiceCache,
-		d.bwManager,
-		d.db,
-		d.nodeAddrs,
-	)
-	params.NodeDiscovery.RegisterK8sGetters(d.k8sWatcher)
-
-	if option.Config.BGPAnnounceLBIP || option.Config.BGPAnnouncePodCIDR {
-		switch option.Config.IPAMMode() {
-		case ipamOption.IPAMKubernetes:
-			d.bgpSpeaker.SubscribeToLocalNodeResource(ctx, params.Resources.LocalNode)
-		case ipamOption.IPAMClusterPool:
-			d.bgpSpeaker.SubscribeToLocalCiliumNodeResource(ctx, params.Resources.LocalCiliumNode)
-		}
-	}
-
-	d.lrpManager.RegisterSvcCache(d.k8sWatcher.K8sSvcCache)
-	if option.Config.BGPAnnounceLBIP {
-		d.bgpSpeaker.RegisterSvcCache(d.k8sWatcher.K8sSvcCache)
 	}
 
 	bootstrapStats.daemonInit.End(true)
@@ -575,7 +491,7 @@ func newDaemon(ctx context.Context, cleaner *daemonCleanup, params *daemonParams
 		bootstrapStats.restore.End(true)
 	}
 
-	debug.RegisterStatusObject("k8s-service-cache", d.k8sWatcher.K8sSvcCache)
+	debug.RegisterStatusObject("k8s-service-cache", d.k8sSvcCache)
 	debug.RegisterStatusObject("ipam", d.ipam)
 	debug.RegisterStatusObject("ongoing-endpoint-creations", d.endpointCreations)
 
@@ -588,8 +504,8 @@ func newDaemon(ctx context.Context, cleaner *daemonCleanup, params *daemonParams
 		// before the relevant subystems are being shut down.
 		cleaner.preCleanupFuncs.Add(func() {
 			// Stop k8s watchers
-			log.Info("Stopping k8s service handler")
-			d.k8sWatcher.StopK8sServiceHandler()
+			log.Info("Stopping k8s watcher")
+			d.k8sWatcher.StopWatcher()
 
 			// Iterate over the policy repository and remove L7 DNS part
 			needsPolicyRegen := false
@@ -681,7 +597,8 @@ func newDaemon(ctx context.Context, cleaner *daemonCleanup, params *daemonParams
 		// context deadline or if the context has been cancelled, the context's
 		// error will be returned. Otherwise, it succeeded.
 		if !option.Config.DryMode {
-			if err := d.k8sWatcher.WaitForCRDsToRegister(d.ctx); err != nil {
+			_, err := params.CRDSyncPromise.Await(d.ctx)
+			if err != nil {
 				return nil, restoredEndpoints, err
 			}
 		}
@@ -725,8 +642,8 @@ func newDaemon(ctx context.Context, cleaner *daemonCleanup, params *daemonParams
 	// and the k8s service watcher depends on option.Config.EnableNodePort flag
 	// which can be modified after the device detection.
 	var devices []string
-	if d.deviceManager != nil {
-		if devices, err = d.deviceManager.Detect(params.Clientset.IsEnabled()); err != nil {
+	if params.DeviceManager != nil {
+		if devices, err = params.DeviceManager.Detect(params.Clientset.IsEnabled()); err != nil {
 			if option.Config.AreDevicesRequired() {
 				// Fail hard if devices are required to function.
 				return nil, nil, fmt.Errorf("failed to detect devices: %w", err)
@@ -755,9 +672,6 @@ func newDaemon(ctx context.Context, cleaner *daemonCleanup, params *daemonParams
 		case len(option.Config.MasqueradeInterfaces) > 0:
 			err = fmt.Errorf("BPF masquerade does not allow to specify devices via --%s (use --%s instead)",
 				option.MasqueradeInterfaces, option.Devices)
-		case option.Config.TunnelingEnabled() && !option.Config.EnableSocketLB:
-			err = fmt.Errorf("BPF masquerade requires socket-LB (--%s=\"false\")",
-				option.EnableSocketLB)
 		}
 		if err != nil {
 			log.WithError(err).Error("unable to initialize BPF masquerade support")
@@ -790,21 +704,19 @@ func newDaemon(ctx context.Context, cleaner *daemonCleanup, params *daemonParams
 		}
 	}
 
+	if params.DirectoryPolicyWatcher != nil {
+		params.DirectoryPolicyWatcher.WatchDirectoryPolicyResources(d.ctx, &d)
+	}
+
 	// Some of the k8s watchers rely on option flags set above (specifically
 	// EnableBPFMasquerade), so we should only start them once the flag values
 	// are set.
 	if params.Clientset.IsEnabled() {
 		bootstrapStats.k8sInit.Start()
 
-		// Launch the policy K8s watcher
-		if params.PolicyK8sWatcher != nil {
-			params.PolicyK8sWatcher.WatchK8sPolicyResources(d.ctx, &d)
-		}
-
 		// Launch the K8s watchers in parallel as we continue to process other
 		// daemon options.
-		resources, cacheOnly := d.k8sWatcher.ResourceGroups()
-		d.k8sWatcher.InitK8sSubsystem(d.ctx, resources, cacheOnly, params.CacheStatus)
+		d.k8sWatcher.InitK8sSubsystem(d.ctx, params.CacheStatus)
 		bootstrapStats.k8sInit.End(true)
 	} else {
 		close(params.CacheStatus)
@@ -822,7 +734,7 @@ func newDaemon(ctx context.Context, cleaner *daemonCleanup, params *daemonParams
 		log.Info("Skipping kvstore configuration")
 	} else {
 		bootstrapStats.kvstore.Start()
-		d.initKVStore()
+		d.initKVStore(params.ServiceResolver)
 		bootstrapStats.kvstore.End(true)
 	}
 
@@ -868,11 +780,11 @@ func newDaemon(ctx context.Context, cleaner *daemonCleanup, params *daemonParams
 		}
 
 		// Start services watcher
-		serviceStore.JoinClusterServices(d.k8sWatcher.K8sSvcCache, option.Config.ClusterName)
+		serviceStore.JoinClusterServices(d.k8sSvcCache, option.Config.ClusterName)
 	}
 
 	// Start IPAM
-	d.startIPAM(params.Resources.LocalCiliumNode)
+	d.startIPAM()
 
 	bootstrapStats.restore.Start()
 	// restore endpoints before any IPs are allocated to avoid eventual IP
@@ -977,15 +889,10 @@ func newDaemon(ctx context.Context, cleaner *daemonCleanup, params *daemonParams
 		return nil, nil, err
 	}
 
-	if err := d.datapath.Loader().RestoreTemplates(option.Config.StateDir); err != nil {
-		log.WithError(err).Error("Unable to restore previous BPF templates")
-	}
-
 	// Start watcher for endpoint IP --> identity mappings in key-value store.
 	// this needs to be done *after* init() for the daemon in that function,
 	// we populate the IPCache with the host's IP(s).
 	d.ipcache.InitIPIdentityWatcher(d.ctx, params.StoreFactory)
-	identitymanager.Subscribe(d.policy)
 
 	if err := params.IPsecKeyCustodian.StartBackgroundJobs(d.Datapath().Node()); err != nil {
 		log.WithError(err).Error("Unable to start IPsec key watcher")
@@ -1000,14 +907,12 @@ func (d *Daemon) Close() {
 		d.datapathRegenTrigger.Shutdown()
 	}
 	identitymanager.RemoveAll()
-	d.cgroupManager.Close()
 
 	// Ensures all controllers are stopped!
 	d.controllers.RemoveAllAndWait()
 }
 
-// TriggerReloadWithoutCompile causes all BPF programs and maps to be reloaded,
-// without recompiling the datapath logic for each endpoint. It first attempts
+// TriggerReload causes all BPF programs and maps to be reloaded. It first attempts
 // to recompile the base programs, and if this fails returns an error. If base
 // program load is successful, it subsequently triggers regeneration of all
 // endpoints and returns a waitgroup that may be used by the caller to wait for
@@ -1016,7 +921,7 @@ func (d *Daemon) Close() {
 // If an error is returned, then no regeneration was successful. If no error
 // is returned, then the base programs were successfully regenerated, but
 // endpoints may or may not have successfully regenerated.
-func (d *Daemon) TriggerReloadWithoutCompile(reason string) (*sync.WaitGroup, error) {
+func (d *Daemon) TriggerReload(reason string) (*sync.WaitGroup, error) {
 	log.Debugf("BPF reload triggered from %s", reason)
 	if err := d.Datapath().Orchestrator().Reinitialize(d.ctx); err != nil {
 		return nil, fmt.Errorf("unable to recompile base programs from %s: %w", reason, err)
@@ -1024,7 +929,7 @@ func (d *Daemon) TriggerReloadWithoutCompile(reason string) (*sync.WaitGroup, er
 
 	regenRequest := &regeneration.ExternalRegenerationMetadata{
 		Reason:            reason,
-		RegenerationLevel: regeneration.RegenerateWithDatapathLoad,
+		RegenerationLevel: regeneration.RegenerateWithDatapath,
 	}
 	return d.endpointManager.RegenerateAllEndpoints(regenRequest), nil
 }
@@ -1034,7 +939,7 @@ func (d *Daemon) datapathRegen(reasons []string) {
 
 	regenerationMetadata := &regeneration.ExternalRegenerationMetadata{
 		Reason:            reason,
-		RegenerationLevel: regeneration.RegenerateWithDatapathRewrite,
+		RegenerationLevel: regeneration.RegenerateWithDatapath,
 	}
 	d.endpointManager.RegenerateAllEndpoints(regenerationMetadata)
 }
@@ -1053,10 +958,13 @@ func (d *Daemon) TriggerDatapathRegen(force bool, reason string) {
 func changedOption(key string, value option.OptionSetting, data interface{}) {
 	d := data.(*Daemon)
 	if key == option.Debug {
-		// Set the debug toggle (this can be a no-op)
-		if d.DebugEnabled() {
+		// Set the log level of the agent (this can be a no-op)
+		if option.Config.Opts.IsEnabled(option.Debug) {
 			logging.SetLogLevelToDebug()
+		} else {
+			logging.SetDefaultLogLevel()
 		}
+
 		// Reflect log level change to proxies
 		// Might not be initialized yet
 		if option.Config.EnableL7Proxy {

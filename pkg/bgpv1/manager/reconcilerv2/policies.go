@@ -16,7 +16,6 @@ import (
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/util/sets"
 
-	"github.com/cilium/cilium/pkg/bgpv1/manager/instance"
 	"github.com/cilium/cilium/pkg/bgpv1/types"
 	"github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	"github.com/cilium/cilium/pkg/k8s/resource"
@@ -36,7 +35,7 @@ type RoutePolicyMap map[string]*types.RoutePolicy
 type ReconcileRoutePoliciesParams struct {
 	Logger          logrus.FieldLogger
 	Ctx             context.Context
-	Instance        *instance.BGPInstance
+	Router          types.Router
 	DesiredPolicies RoutePolicyMap
 	CurrentPolicies RoutePolicyMap
 }
@@ -73,7 +72,7 @@ func ReconcileRoutePolicies(rp *ReconcileRoutePoliciesParams) (RoutePolicyMap, e
 			types.PolicyLogField: p.Name,
 		}).Debug("Adding route policy")
 
-		err := rp.Instance.Router.AddRoutePolicy(rp.Ctx, types.RoutePolicyRequest{
+		err := rp.Router.AddRoutePolicy(rp.Ctx, types.RoutePolicyRequest{
 			DefaultExportAction: types.RoutePolicyActionReject, // do not advertise routes by default
 			Policy:              p,
 		})
@@ -94,13 +93,13 @@ func ReconcileRoutePolicies(rp *ReconcileRoutePoliciesParams) (RoutePolicyMap, e
 		}).Debug("Updating (re-creating) route policy")
 
 		existing := rp.CurrentPolicies[p.Name]
-		err := rp.Instance.Router.RemoveRoutePolicy(rp.Ctx, types.RoutePolicyRequest{Policy: existing})
+		err := rp.Router.RemoveRoutePolicy(rp.Ctx, types.RoutePolicyRequest{Policy: existing})
 		if err != nil {
 			return runningPolicies, err
 		}
 		delete(runningPolicies, existing.Name)
 
-		err = rp.Instance.Router.AddRoutePolicy(rp.Ctx, types.RoutePolicyRequest{
+		err = rp.Router.AddRoutePolicy(rp.Ctx, types.RoutePolicyRequest{
 			DefaultExportAction: types.RoutePolicyActionReject, // do not advertise routes by default
 			Policy:              p,
 		})
@@ -118,7 +117,7 @@ func ReconcileRoutePolicies(rp *ReconcileRoutePoliciesParams) (RoutePolicyMap, e
 			types.PolicyLogField: p.Name,
 		}).Debug("Removing route policy")
 
-		err := rp.Instance.Router.RemoveRoutePolicy(rp.Ctx, types.RoutePolicyRequest{Policy: p})
+		err := rp.Router.RemoveRoutePolicy(rp.Ctx, types.RoutePolicyRequest{Policy: p})
 		if err != nil {
 			return runningPolicies, err
 		}
@@ -143,7 +142,7 @@ func ReconcileRoutePolicies(rp *ReconcileRoutePoliciesParams) (RoutePolicyMap, e
 			SoftResetDirection: types.SoftResetDirectionOut, // we are using only export policies
 		}
 
-		err = rp.Instance.Router.ResetNeighbor(rp.Ctx, req)
+		err = rp.Router.ResetNeighbor(rp.Ctx, req)
 		if err != nil {
 			// non-fatal error (may happen if the neighbor is not up), just log it
 			rp.Logger.WithFields(logrus.Fields{
@@ -155,8 +154,13 @@ func ReconcileRoutePolicies(rp *ReconcileRoutePoliciesParams) (RoutePolicyMap, e
 	return runningPolicies, nil
 }
 
-func PolicyName(peer, family, advertType string) string {
-	return fmt.Sprintf("%s-%s-%s", peer, family, advertType)
+// PolicyName returns a unique route policy name for the provided peer, family and advertisement type.
+// If there a is a need for multiple route policies per advertisement type, unique resourceID can be provided.
+func PolicyName(peer, family string, advertType v2alpha1.BGPAdvertisementType, resourceID string) string {
+	if resourceID == "" {
+		return fmt.Sprintf("%s-%s-%s", peer, family, advertType)
+	}
+	return fmt.Sprintf("%s-%s-%s-%s", peer, family, advertType, resourceID)
 }
 
 func CreatePolicy(name string, peerAddr netip.Addr, v4Prefixes, v6Prefixes types.PolicyPrefixMatchList, advert v2alpha1.BGPAdvertisement) (*types.RoutePolicy, error) {

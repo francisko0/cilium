@@ -16,6 +16,7 @@ import (
 	"github.com/vishvananda/netlink"
 
 	"github.com/cilium/cilium/pkg/datapath/garp"
+	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/ebpf"
 	"github.com/cilium/cilium/pkg/maps/l2respondermap"
@@ -193,9 +194,6 @@ func (p *l2ResponderReconciler) fullReconciliation(txn statedb.ReadTxn) (err err
 
 	log.Debug("l2 announcer table full reconciliation")
 
-	// Get all desired entries in the table
-	iter, _ := tbl.All(txn)
-
 	// Prepare index for desired entries based on map key
 	type desiredEntry struct {
 		satisfied bool
@@ -203,7 +201,7 @@ func (p *l2ResponderReconciler) fullReconciliation(txn statedb.ReadTxn) (err err
 	}
 	desiredMap := make(map[l2respondermap.L2ResponderKey]desiredEntry)
 
-	statedb.ProcessEach(iter, func(e *tables.L2AnnounceEntry, _ uint64) error {
+	statedb.ProcessEach(tbl.All(txn), func(e *tables.L2AnnounceEntry, _ uint64) error {
 		// Ignore IPv6 addresses, L2 is IPv4 only
 		if e.IP.Is6() {
 			return nil
@@ -295,7 +293,9 @@ func (clr *cachingLinkResolver) LinkIndex(name string) (int, error) {
 		return idx, nil
 	}
 
-	link, err := clr.nl.LinkByName(name)
+	link, err := safenetlink.WithRetryResult(func() (netlink.Link, error) {
+		return clr.nl.LinkByName(name)
+	})
 	if err != nil {
 		return 0, err
 	}

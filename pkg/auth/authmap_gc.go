@@ -34,7 +34,7 @@ type authMapGarbageCollector struct {
 	ciliumNodesSynced     bool
 	ciliumNodesDeleted    map[uint16]struct{}
 
-	ciliumIdentitiesMutex      lock.Mutex
+	ciliumIdentitiesMutex      lock.RWMutex
 	ciliumIdentitiesDiscovered map[identity.NumericIdentity]struct{}
 	ciliumIdentitiesSynced     bool
 	ciliumIdentitiesDeleted    map[identity.NumericIdentity]struct{}
@@ -401,9 +401,11 @@ func (r *authMapGarbageCollector) cleanupExpiredEntries(_ context.Context) error
 // Endpoints
 
 func (r *authMapGarbageCollector) subscribeToEndpointEvents(endpointManager endpointmanager.EndpointManager) {
+	localEPs := endpointManager.GetEndpoints()
+
 	r.endpointsCacheMutex.Lock()
 	r.endpointsCache = map[uint16]*endpoint.Endpoint{}
-	for _, ep := range endpointManager.GetEndpoints() {
+	for _, ep := range localEPs {
 		r.endpointsCache[ep.GetID16()] = ep
 	}
 	r.endpointsCacheSynced = true
@@ -435,9 +437,12 @@ func (r *authMapGarbageCollector) EndpointRestored(ep *endpoint.Endpoint) {
 }
 
 func (r *authMapGarbageCollector) cleanupEndpoints(_ context.Context) error {
+	r.ciliumIdentitiesMutex.RLock()
 	if r.ciliumIdentitiesDiscovered == nil || !r.ciliumIdentitiesSynced || !r.endpointsCacheSynced {
+		r.ciliumIdentitiesMutex.RUnlock()
 		return nil
 	}
+	r.ciliumIdentitiesMutex.RUnlock()
 
 	r.endpointsCacheMutex.RLock()
 	idsInUse := map[identity.NumericIdentity]struct{}{}
@@ -447,7 +452,8 @@ func (r *authMapGarbageCollector) cleanupEndpoints(_ context.Context) error {
 		}
 	}
 	r.endpointsCacheMutex.RUnlock()
-
+	r.ciliumIdentitiesMutex.RLock()
+	defer r.ciliumIdentitiesMutex.RUnlock()
 	for id := range r.ciliumIdentitiesDiscovered {
 		if _, exists := idsInUse[id]; !exists {
 			if err := r.cleanupDeletedEndpointIdentity(id); err != nil {

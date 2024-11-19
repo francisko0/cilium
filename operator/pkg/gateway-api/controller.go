@@ -28,6 +28,8 @@ const (
 	backendServiceIndex       = "backendServiceIndex"
 	backendServiceImportIndex = "backendServiceImportIndex"
 	gatewayIndex              = "gatewayIndex"
+	gammaBackendServiceIndex  = "gammaBackendServiceIndex"
+	gammaListenerServiceIndex = "gammaListenerServiceIndex"
 )
 
 func hasMatchingController(ctx context.Context, c client.Client, controllerName string) func(object client.Object) bool {
@@ -173,9 +175,9 @@ func onlyStatusChanged() predicate.Predicate {
 					return false
 				}
 				return !cmp.Equal(o.Status, n.Status, option)
-			case *gatewayv1alpha2.GRPCRoute:
-				o, _ := e.ObjectOld.(*gatewayv1alpha2.GRPCRoute)
-				n, ok := e.ObjectNew.(*gatewayv1alpha2.GRPCRoute)
+			case *gatewayv1.GRPCRoute:
+				o, _ := e.ObjectOld.(*gatewayv1.GRPCRoute)
+				n, ok := e.ObjectNew.(*gatewayv1.GRPCRoute)
 				if !ok {
 					return false
 				}

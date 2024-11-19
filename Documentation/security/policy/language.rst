@@ -29,6 +29,9 @@ can talk to each other. Layer 3 policies can be specified using the following me
   to the local host serving the endpoints or all connectivity to outside of
   the cluster.
 
+* `Node based`: This is an extension of ``remote-node`` entity. Optionally nodes
+   can have unique identity that can be used to allow/block access only from specific ones.
+
 * `CIDR based`: This is used to describe the relationship to or from external
   services if the remote peer is not an endpoint. This requires to hardcode either
   IP addresses or subnets into the policies. This construct should be used as a
@@ -361,6 +364,13 @@ all
     The all entity represents the combination of all known clusters as well
     world and whitelists all communication.
 
+.. note:: The ``kube-apiserver`` entity may not work for *ingress traffic* in some Kubernetes
+   distributions, such as Azure AKS and GCP GKE. This is due to the fact that ingress
+   control-plane traffic is being tunneled through worker nodes, which does not preserve
+   the original source IP. You may be able to use a broader ``fromEntities: cluster`` rule
+   instead. Restricting *egress traffic* via ``toEntities: kube-apiserver`` however is expected
+   to work on these Kubernetes distributions.
+
 Access to/from kube-apiserver
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -407,8 +417,8 @@ serving the particular endpoint.
 
 .. _policy-remote-node:
 
-Access to/from all nodes in the cluster
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Access to/from all nodes in the cluster (or clustermesh)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Allow all endpoints with the label ``env=dev`` to receive traffic from any host
 in the cluster that Cilium is running on.
@@ -446,6 +456,44 @@ endpoints that have the label ``role=public``.
 .. only:: epub or latex
 
         .. literalinclude:: ../../../examples/policies/l3/entities/world.json
+
+.. _policy_node_based:
+.. _Node based:
+
+Node based
+----------
+
+.. note:: Example below with ``fromNodes/toNodes`` fields will only take effect when
+     ``enable-node-selector-labels`` flag is set to true (or equivalent Helm value
+     ``nodeSelectorLabels: true``).
+
+When ``--enable-node-selector-labels=true`` is specified, every cilium-agent
+allocates a different local :ref:`security identity <arch_id_security>` for all
+other nodes. But instead of using :ref:`local scoped identity <local_scoped_identity>`
+it uses :ref:`remote-node scoped identity<remote_node_scoped_identity>` identity range.
+
+By default all labels that ``Node`` object has attached are taken into account,
+which might result in allocation of **unique** identity for each remote-node.
+For these cases it is also possible to filter only
+:ref:`security relevant labels <security relevant labels>` with ``--node-labels`` flag.
+
+This example shows how to allow all endpoints with the label ``env=prod`` to receive
+traffic **only** from control plane (labeled
+``node-role.kubernetes.io/control-plane=""``) nodes in the cluster (or clustermesh).
+
+.. only:: html
+
+   .. tabs::
+     .. group-tab:: k8s YAML
+
+        .. literalinclude:: ../../../examples/policies/l3/entities/customnodes.yaml
+     .. group-tab:: JSON
+
+        .. literalinclude:: ../../../examples/policies/l3/entities/customnodes.json
+
+.. only:: epub or latex
+
+        .. literalinclude:: ../../../examples/policies/l3/entities/customnodes.json
 
 .. _policy_cidr:
 .. _CIDR based:
@@ -674,10 +722,15 @@ which is defined as follows:
 
         // PortProtocol specifies an L4 port with an optional transport protocol
         type PortProtocol struct {
-                // Port is an L4 port number. For now the string will be strictly
-                // parsed as a single uint16. In the future, this field may support
-                // ranges in the form "1024-2048"
+                // Port can be an L4 port number, or a name in the form of "http"
+                // or "http-8080". EndPort is ignored if Port is a named port.
                 Port string `json:"port"`
+
+                // EndPort can only be an L4 port number. It is ignored when
+                // Port is a named port.
+                //
+                // +optional
+                EndPort int32 `json:"endPort,omitempty"`
 
                 // Protocol is the L4 protocol. If omitted or empty, any protocol
                 // matches. Accepted values: "TCP", "UDP", ""/"ANY"
@@ -707,6 +760,27 @@ only be able to emit packets using TCP on port 80, to any layer 3 destination:
 .. only:: epub or latex
 
         .. literalinclude:: ../../../examples/policies/l4/l4.json
+
+Example Port Ranges
+~~~~~~~~~~~~~~~~~~~
+
+The following rule limits all endpoints with the label ``app=myService`` to
+only be able to emit packets using TCP on ports 80-444, to any layer 3 destination:
+
+.. only:: html
+
+   .. tabs::
+     .. group-tab:: k8s YAML
+
+        .. literalinclude:: ../../../examples/policies/l4/l4_port_range.yaml
+     .. group-tab:: JSON
+
+        .. literalinclude:: ../../../examples/policies/l4/l4_port_range.json
+
+.. only:: epub or latex
+
+        .. literalinclude:: ../../../examples/policies/l4/l4_port_range.json
+
 
 Labels-dependent Layer 4 rule
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -883,6 +957,8 @@ latter rule will have no effect.
           protocol specific access denied message is crafted and returned, e.g.
           an *HTTP 403 access denied* is sent back for HTTP requests which
           violate the policy, or a *DNS REFUSED* response for DNS requests.
+
+.. note:: Layer 7 rules do not currently support port ranges.
 
 .. note:: There is currently a max limit of 40 ports with layer 7 policies per
           endpoint. This might change in the future when support for ranges is
@@ -1278,6 +1354,39 @@ Deny policies do not support: policy enforcement at L7, i.e., specifically
 denying an URL and ``toFQDNs``, i.e., specifically denying traffic to a specific
 domain name.
 
+.. _disk_policies:
+
+Disk based Cilium Network Policies
+==================================
+This functionality enables users to place network policy YAML files directly into
+the node's filesystem, bypassing the need for definition via k8s CRD. 
+By setting the config field ``static-cnp-path``, users specify the directory from 
+which policies will be loaded. The Cilium agent then processes all policy YAML files 
+present in this directory, transforming them into rules that are incorporated into 
+the policy engine. Additionally, the Cilium agent monitors this directory for any 
+new policy YAML files as well as any updates or deletions, making corresponding 
+updates to the policy engine's rules. It is important to note that this feature 
+only supports CiliumNetworkPolicy and CiliumClusterwideNetworkPolicy.
+
+The directory that the Cilium agent needs to monitor should be mounted from the host 
+using volume mounts. For users deploying via Helm, this can be enabled via ``extraArgs``
+and ``extraHostPathMounts`` as follows:
+
+.. code-block:: yaml
+
+   extraArgs:                                                                                                                                        
+   - --static-cnp-path=/policies                                                                                                                   
+   extraHostPathMounts:                                                                                                                              
+   - name: static-policies                                                                                                                         
+      mountPath: /policies                                                                                                                          
+      hostPath: /policies                                                                                                                           
+      hostPathType: Directory  
+
+To determine whether a policy was established via Kubernetes CRD or directly from a directory, 
+execute the command ``cilium policy get`` and examine the source attribute within the policy. 
+In output, you could notice policies that have been sourced from a directory will have the 
+``source`` field set as ``directory``. Additionally, ``cilium endpoint get <endpoint_id>`` also have 
+fields to show the source of policy associated with that endpoint.
 
 Previous limitations and known issues
 -------------------------------------

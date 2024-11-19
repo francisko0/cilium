@@ -4,14 +4,18 @@
 package k8s
 
 import (
+	"context"
 	"errors"
+	"sync"
 
+	"github.com/cilium/stream"
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/labels"
 
 	"github.com/cilium/cilium/pkg/k8s"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	"github.com/cilium/cilium/pkg/k8s/types"
+	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/policy/api"
 	"github.com/cilium/cilium/pkg/time"
@@ -113,7 +117,7 @@ func (p *policyWatcher) updateToServicesPolicies(svcID k8s.ServiceID, newSVC, ol
 func (p *policyWatcher) resolveToServices(key resource.Key, cnp *types.SlimCNP) {
 	// We consult the service cache to obtain the service endpoints
 	// which are selected by the ToServices selectors found in the CNP.
-	p.svcCache.ForEachService(func(svcID k8s.ServiceID, svc *k8s.Service, eps *k8s.Endpoints) bool {
+	p.svcCache.ForEachService(func(svcID k8s.ServiceID, svc *k8s.Service, eps *k8s.EndpointSlices) bool {
 		if !p.isSelectableService(svc) {
 			return true // continue
 		}
@@ -255,14 +259,14 @@ func serviceRefMatches(ref *api.K8sServiceNamespace, svcID k8s.ServiceID) bool {
 type serviceEndpoints struct {
 	svcID k8s.ServiceID
 	svc   *k8s.Service
-	eps   *k8s.Endpoints
+	eps   *k8s.EndpointSlices
 
 	valid  bool
 	cached []api.CIDR
 }
 
 // newServiceEndpoints returns an initialized serviceEndpoints struct
-func newServiceEndpoints(svcID k8s.ServiceID, svc *k8s.Service, eps *k8s.Endpoints) *serviceEndpoints {
+func newServiceEndpoints(svcID k8s.ServiceID, svc *k8s.Service, eps *k8s.EndpointSlices) *serviceEndpoints {
 	return &serviceEndpoints{
 		svcID: svcID,
 		svc:   svc,
@@ -277,7 +281,7 @@ func (s *serviceEndpoints) endpoints() []api.CIDR {
 		return s.cached
 	}
 
-	prefixes := s.eps.Prefixes()
+	prefixes := s.eps.GetEndpoints().Prefixes()
 	s.cached = make([]api.CIDR, 0, len(prefixes))
 	for _, prefix := range prefixes {
 		s.cached = append(s.cached, api.CIDR(prefix.String()))
@@ -319,4 +323,98 @@ func (s *serviceEndpoints) processRule(rule *api.Rule) (numMatches int) {
 		}
 	}
 	return numMatches
+}
+
+type serviceQueue struct {
+	mu    *lock.Mutex
+	cond  *sync.Cond
+	queue []k8s.ServiceNotification
+}
+
+func newServiceQueue() *serviceQueue {
+	mu := new(lock.Mutex)
+	return &serviceQueue{
+		mu:    mu,
+		cond:  sync.NewCond(mu),
+		queue: []k8s.ServiceNotification{},
+	}
+}
+
+func (q *serviceQueue) enqueue(item k8s.ServiceNotification) {
+	q.mu.Lock()
+	q.queue = append(q.queue, item)
+	q.cond.Signal()
+	q.mu.Unlock()
+}
+
+func (q *serviceQueue) signal() {
+	q.mu.Lock()
+	q.cond.Signal()
+	q.mu.Unlock()
+}
+
+func (q *serviceQueue) dequeue(ctx context.Context) (item k8s.ServiceNotification, ok bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	for len(q.queue) == 0 && ctx.Err() == nil {
+		q.cond.Wait()
+	}
+
+	// If ctx is cancelled, we return immediately
+	if ctx.Err() != nil {
+		return item, false
+	}
+
+	item = q.queue[0]
+	q.queue = q.queue[1:]
+
+	return item, true
+}
+
+// serviceNotificationsQueue converts the observable src into a channel.
+// When the provided context is cancelled the underlying subscription is
+// cancelled and the channel is closed.
+// In contrast to stream.ToChannel, this function has an unbounded buffer,
+// meaning the consumer must always consume the channel (or cancel ctx)
+func serviceNotificationsQueue(ctx context.Context, src stream.Observable[k8s.ServiceNotification]) <-chan k8s.ServiceNotification {
+	ctx, cancel := context.WithCancel(ctx)
+	ch := make(chan k8s.ServiceNotification)
+	q := newServiceQueue()
+
+	// This go routine is woken up whenever there a new item has been added to
+	// queue and forwards it to ch. It exits when context ctx is cancelled.
+	go func() {
+		// Close downstream channel on exit
+		defer close(ch)
+
+		// Exit the for-loop below if the context is cancelled.
+		// See https://pkg.go.dev/context#AfterFunc for a more detailed
+		// explanation of this pattern
+		cleanupCancellation := context.AfterFunc(ctx, q.signal)
+		defer cleanupCancellation()
+
+		for {
+			item, ok := q.dequeue(ctx)
+			if !ok {
+				return
+			}
+
+			select {
+			case ch <- item:
+				continue
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	src.Observe(ctx,
+		q.enqueue,
+		func(err error) {
+			cancel() // stops above go routine
+		},
+	)
+
+	return ch
 }

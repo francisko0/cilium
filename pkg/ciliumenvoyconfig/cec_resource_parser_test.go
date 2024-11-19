@@ -15,9 +15,11 @@ import (
 	envoy_config_core "github.com/cilium/proxy/go/envoy/config/core/v3"
 	envoy_config_listener "github.com/cilium/proxy/go/envoy/config/listener/v3"
 	envoy_config_http_healthcheck "github.com/cilium/proxy/go/envoy/extensions/filters/http/health_check/v3"
+	envoy_upstream_codec "github.com/cilium/proxy/go/envoy/extensions/filters/http/upstream_codec/v3"
 	envoy_config_http "github.com/cilium/proxy/go/envoy/extensions/filters/network/http_connection_manager/v3"
 	envoy_config_tcp "github.com/cilium/proxy/go/envoy/extensions/filters/network/tcp_proxy/v3"
 	envoy_config_tls "github.com/cilium/proxy/go/envoy/extensions/transport_sockets/tls/v3"
+	envoy_upstreams_http_v3 "github.com/cilium/proxy/go/envoy/extensions/upstreams/http/v3"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -45,7 +47,7 @@ func NewMockPortAllocator() *MockPortAllocator {
 	}
 }
 
-func (m *MockPortAllocator) AllocateProxyPort(name string, ingress, localOnly bool) (uint16, error) {
+func (m *MockPortAllocator) AllocateCRDProxyPort(name string) (uint16, error) {
 	if mp, exists := m.ports[name]; exists {
 		return mp.port, nil
 	}
@@ -74,6 +76,108 @@ func (m *MockPortAllocator) ReleaseProxyPort(name string) error {
 		delete(m.ports, name)
 	}
 	return nil
+}
+
+func TestUpstreamInject(t *testing.T) {
+	//
+	// Empty options
+	//
+	var opts envoy_upstreams_http_v3.HttpProtocolOptions
+	changed, err := injectCiliumUpstreamL7Filter(&opts, false)
+	assert.Nil(t, err)
+	assert.True(t, changed)
+	assert.NotNil(t, opts.HttpFilters)
+	assert.Len(t, opts.HttpFilters, 2)
+	assert.Equal(t, "cilium.l7policy", opts.HttpFilters[0].Name)
+	assert.Equal(t, ciliumL7FilterTypeURL, opts.HttpFilters[0].GetTypedConfig().TypeUrl)
+	assert.Equal(t, "envoy.filters.http.upstream_codec", opts.HttpFilters[1].Name)
+	assert.Equal(t, upstreamCodecFilterTypeURL, opts.HttpFilters[1].GetTypedConfig().TypeUrl)
+	//
+	// Check injected UpstreamProtocolOptions
+	//
+	assert.NotNil(t, opts.GetUseDownstreamProtocolConfig()) // no ALPN support
+
+	// already present
+	changed, err = injectCiliumUpstreamL7Filter(&opts, true)
+	assert.Nil(t, err)
+	assert.False(t, changed)
+	assert.NotNil(t, opts.HttpFilters)
+	assert.Len(t, opts.HttpFilters, 2)
+	assert.Equal(t, "cilium.l7policy", opts.HttpFilters[0].Name)
+	assert.Equal(t, ciliumL7FilterTypeURL, opts.HttpFilters[0].GetTypedConfig().TypeUrl)
+	assert.Equal(t, "envoy.filters.http.upstream_codec", opts.HttpFilters[1].Name)
+	assert.Equal(t, upstreamCodecFilterTypeURL, opts.HttpFilters[1].GetTypedConfig().TypeUrl)
+	//
+	// Existing Upstream protocol options are not overridden
+	//
+	assert.NotNil(t, opts.GetUseDownstreamProtocolConfig())
+
+	// missing codec
+	opts = envoy_upstreams_http_v3.HttpProtocolOptions{
+		HttpFilters: []*envoy_config_http.HttpFilter{
+			{
+				Name: "cilium.l7policy",
+				ConfigType: &envoy_config_http.HttpFilter_TypedConfig{
+					TypedConfig: toAny(&cilium.L7Policy{}),
+				},
+			},
+		},
+	}
+	changed, err = injectCiliumUpstreamL7Filter(&opts, true)
+	assert.Nil(t, err)
+	assert.True(t, changed)
+	assert.NotNil(t, opts.HttpFilters)
+	assert.Len(t, opts.HttpFilters, 2)
+	assert.Equal(t, "cilium.l7policy", opts.HttpFilters[0].Name)
+	assert.Equal(t, ciliumL7FilterTypeURL, opts.HttpFilters[0].GetTypedConfig().TypeUrl)
+	assert.Equal(t, "envoy.filters.http.upstream_codec", opts.HttpFilters[1].Name)
+	assert.Equal(t, upstreamCodecFilterTypeURL, opts.HttpFilters[1].GetTypedConfig().TypeUrl)
+	assert.NotNil(t, opts.GetAutoConfig()) // with ALPN support
+
+	// codec present
+	opts = envoy_upstreams_http_v3.HttpProtocolOptions{
+		HttpFilters: []*envoy_config_http.HttpFilter{
+			{
+				Name: "envoy.filters.http.upstream_codec",
+				ConfigType: &envoy_config_http.HttpFilter_TypedConfig{
+					TypedConfig: toAny(&envoy_upstream_codec.UpstreamCodec{}),
+				},
+			},
+		},
+	}
+	changed, err = injectCiliumUpstreamL7Filter(&opts, true)
+	assert.Nil(t, err)
+	assert.True(t, changed)
+	assert.NotNil(t, opts.HttpFilters)
+	assert.Len(t, opts.HttpFilters, 2)
+	assert.Equal(t, "cilium.l7policy", opts.HttpFilters[0].Name)
+	assert.Equal(t, ciliumL7FilterTypeURL, opts.HttpFilters[0].GetTypedConfig().TypeUrl)
+	assert.Equal(t, "envoy.filters.http.upstream_codec", opts.HttpFilters[1].Name)
+	assert.Equal(t, upstreamCodecFilterTypeURL, opts.HttpFilters[1].GetTypedConfig().TypeUrl)
+	assert.NotNil(t, opts.GetAutoConfig()) // with ALPN support
+
+	// wrong order
+	// codec present
+	opts = envoy_upstreams_http_v3.HttpProtocolOptions{
+		HttpFilters: []*envoy_config_http.HttpFilter{
+			{
+				Name: "envoy.filters.http.upstream_codec",
+				ConfigType: &envoy_config_http.HttpFilter_TypedConfig{
+					TypedConfig: toAny(&envoy_upstream_codec.UpstreamCodec{}),
+				},
+			},
+			{
+				Name: "cilium.l7policy",
+				ConfigType: &envoy_config_http.HttpFilter_TypedConfig{
+					TypedConfig: toAny(&cilium.L7Policy{}),
+				},
+			},
+		},
+	}
+	changed, err = injectCiliumUpstreamL7Filter(&opts, true)
+	assert.NotNil(t, err)
+	assert.False(t, changed)
+	assert.ErrorContains(t, err, "filter after codec filter: name:\"cilium.l7policy\"")
 }
 
 var xds1 = `version_info: "0"
@@ -505,6 +609,7 @@ func TestCiliumEnvoyConfigMulti(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, resources.Listeners, 1)
 	assert.Equal(t, "namespace/name/multi-resource-listener", resources.Listeners[0].Name)
+	assert.Nil(t, resources.Listeners[0].GetInternalListener())
 	assert.Equal(t, uint32(10000), resources.Listeners[0].Address.GetSocketAddress().GetPortValue())
 	assert.Len(t, resources.Listeners[0].FilterChains, 1)
 	chain := resources.Listeners[0].FilterChains[0]
@@ -650,6 +755,103 @@ spec:
                 port_value: 10001
 `
 
+var ciliumEnvoyConfigInternalListener = `apiVersion: cilium.io/v2
+kind: CiliumEnvoyConfig
+metadata:
+  name: missing-internal-listener
+spec:
+  version_info: "0"
+  resources:
+  - "@type": type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment
+    cluster_name: internal_listener_cluster
+    endpoints:
+    - lb_endpoints:
+      - endpoint:
+          address:
+            envoy_internal_address:
+              server_listener_name: internal-listener
+  - "@type": type.googleapis.com/envoy.config.listener.v3.Listener
+    name: internal-listener
+    internal_listener: {}
+`
+
+func TestCiliumEnvoyConfigInternalListener(t *testing.T) {
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	parser := cecResourceParser{
+		logger:        logger,
+		portAllocator: NewMockPortAllocator(),
+	}
+
+	jsonBytes, err := yaml.YAMLToJSON([]byte(ciliumEnvoyConfigInternalListener))
+	require.NoError(t, err)
+	cec := &cilium_v2.CiliumEnvoyConfig{}
+	err = json.Unmarshal(jsonBytes, cec)
+	require.NoError(t, err)
+	assert.Len(t, cec.Spec.Resources, 2)
+	assert.Equal(t, "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment", cec.Spec.Resources[0].TypeUrl)
+	assert.Equal(t, "type.googleapis.com/envoy.config.listener.v3.Listener", cec.Spec.Resources[1].TypeUrl)
+
+	resources, err := parser.parseResources("namespace", "name", cec.Spec.Resources, false, false, true)
+	require.NoError(t, err)
+
+	//
+	// Check internal endpoint resource
+	//
+	assert.Len(t, resources.Endpoints, 1)
+	assert.Equal(t, "namespace/name/internal_listener_cluster", resources.Endpoints[0].ClusterName)
+	assert.Len(t, resources.Endpoints[0].Endpoints, 1)
+	assert.Len(t, resources.Endpoints[0].Endpoints[0].LbEndpoints, 1)
+	addr := resources.Endpoints[0].Endpoints[0].LbEndpoints[0].GetEndpoint().Address
+	assert.NotNil(t, addr)
+	assert.NotNil(t, addr.GetEnvoyInternalAddress())
+	assert.Equal(t, "namespace/name/internal-listener", addr.GetEnvoyInternalAddress().GetServerListenerName())
+
+	//
+	// Check internal listener
+	//
+	assert.Len(t, resources.Listeners, 1)
+	assert.Equal(t, "namespace/name/internal-listener", resources.Listeners[0].Name)
+	assert.NotNil(t, resources.Listeners[0].GetInternalListener())
+}
+
+var ciliumEnvoyConfigMissingInternalListener = `apiVersion: cilium.io/v2
+kind: CiliumEnvoyConfig
+metadata:
+  name: missing-internal-listener
+spec:
+  version_info: "0"
+  resources:
+  - "@type": type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment
+    cluster_name: internal_listener_cluster
+    endpoints:
+    - lb_endpoints:
+      - endpoint:
+          address:
+            envoy_internal_address:
+              server_listener_name: internal-listener
+`
+
+func TestCiliumEnvoyConfigMissingInternalListener(t *testing.T) {
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	parser := cecResourceParser{
+		logger:        logger,
+		portAllocator: NewMockPortAllocator(),
+	}
+
+	jsonBytes, err := yaml.YAMLToJSON([]byte(ciliumEnvoyConfigMissingInternalListener))
+	require.NoError(t, err)
+	cec := &cilium_v2.CiliumEnvoyConfig{}
+	err = json.Unmarshal(jsonBytes, cec)
+	require.NoError(t, err)
+	assert.Len(t, cec.Spec.Resources, 1)
+	assert.Equal(t, "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment", cec.Spec.Resources[0].TypeUrl)
+
+	_, err = parser.parseResources("namespace", "name", cec.Spec.Resources, false, false, true)
+	assert.ErrorContains(t, err, "missing internal listener: internal-listener")
+}
+
 func TestCiliumEnvoyConfigTCPProxy(t *testing.T) {
 	logger := logrus.New()
 	logger.SetOutput(io.Discard)
@@ -776,6 +978,11 @@ spec:
     # Comment out the following line to test on v6 networks
     dns_lookup_family: V4_ONLY
     lb_policy: ROUND_ROBIN
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        explicit_http_config:
+          http2_protocol_options: {}
     load_assignment:
       cluster_name: default/service_google
       endpoints:
@@ -867,6 +1074,18 @@ func TestCiliumEnvoyConfigTCPProxyTermination(t *testing.T) {
 	assert.NotNil(t, addr.GetSocketAddress())
 	assert.Equal(t, "www.google.com", addr.GetSocketAddress().GetAddress())
 	assert.Equal(t, uint32(443), addr.GetSocketAddress().GetPortValue())
+	//
+	// Check upstream filters (injected for L7 LB)
+	//
+	assert.NotNil(t, resources.Clusters[0].TypedExtensionProtocolOptions)
+	assert.NotNil(t, resources.Clusters[0].TypedExtensionProtocolOptions[httpProtocolOptionsType])
+	opts := &envoy_upstreams_http_v3.HttpProtocolOptions{}
+	assert.Nil(t, resources.Clusters[0].TypedExtensionProtocolOptions[httpProtocolOptionsType].UnmarshalTo(opts))
+	assert.NotNil(t, opts.HttpFilters)
+	assert.Equal(t, "cilium.l7policy", opts.HttpFilters[0].Name)
+	assert.Equal(t, ciliumL7FilterTypeURL, opts.HttpFilters[0].GetTypedConfig().TypeUrl)
+	assert.Equal(t, "envoy.filters.http.upstream_codec", opts.HttpFilters[1].Name)
+	assert.Equal(t, upstreamCodecFilterTypeURL, opts.HttpFilters[1].GetTypedConfig().TypeUrl)
 }
 
 func checkCiliumXDS(t *testing.T, cs *envoy_config_core.ConfigSource) {

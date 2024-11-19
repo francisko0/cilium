@@ -10,17 +10,18 @@ runs:
         # no prod yet
         echo "QUAY_CHARTS_ORGANIZATION_DEV=cilium-charts-dev" >> $GITHUB_ENV
         echo "EGRESS_GATEWAY_HELM_VALUES=--helm-set=egressGateway.enabled=true" >> $GITHUB_ENV
+        echo "BGP_CONTROL_PLANE_HELM_VALUES=--helm-set=bgpControlPlane.enabled=true" >> $GITHUB_ENV
         echo "CILIUM_CLI_RELEASE_REPO=cilium/cilium-cli" >> $GITHUB_ENV
         # renovate: datasource=github-releases depName=cilium/cilium-cli
-        CILIUM_CLI_VERSION="v0.16.7"
+        CILIUM_CLI_VERSION="v0.16.19"
         echo "CILIUM_CLI_VERSION=$CILIUM_CLI_VERSION" >> $GITHUB_ENV
         echo "PUSH_TO_DOCKER_HUB=true" >> $GITHUB_ENV
         echo "GCP_PERF_RESULTS_BUCKET=gs://cilium-scale-results" >> $GITHUB_ENV
 
         # renovate: datasource=github-releases depName=kubernetes-sigs/kind
-        KIND_VERSION="v0.22.0"
+        KIND_VERSION="v0.24.0"
         # renovate: datasource=docker
-        KIND_K8S_IMAGE="kindest/node:v1.29.2@sha256:51a1434a5397193442f0be2a297b488b6c919ce8a3931be0ce822606ea5ca245"
+        KIND_K8S_IMAGE="kindest/node:v1.30.4@sha256:976ea815844d5fa93be213437e3ff5754cd599b040946b5cca43ca45c2047114"
         KIND_K8S_VERSION=$(echo "$KIND_K8S_IMAGE" | sed -r 's|.+:(v[0-9a-z.-]+)(@.+)?|\1|')
 
         echo "KIND_VERSION=$KIND_VERSION" >> $GITHUB_ENV

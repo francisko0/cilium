@@ -4,11 +4,15 @@
 package ipsec
 
 import (
+	"log/slog"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/procfs"
 	"github.com/vishvananda/netlink"
 
 	"github.com/cilium/cilium/pkg/common/ipsec"
+	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/metrics"
 )
 
@@ -45,14 +49,16 @@ const (
 )
 
 type xfrmCollector struct {
+	log              *slog.Logger
 	xfrmErrorDesc    *prometheus.Desc
 	nbKeysDesc       *prometheus.Desc
 	nbXFRMStatesDesc *prometheus.Desc
 	nbXFRMPolsDesc   *prometheus.Desc
 }
 
-func NewXFRMCollector() prometheus.Collector {
+func NewXFRMCollector(log *slog.Logger) prometheus.Collector {
 	return &xfrmCollector{
+		log: log,
 		xfrmErrorDesc: prometheus.NewDesc(
 			prometheus.BuildFQName(metrics.Namespace, subsystem, "xfrm_error"),
 			"Total number of xfrm errors",
@@ -86,7 +92,7 @@ func (x *xfrmCollector) Describe(ch chan<- *prometheus.Desc) {
 func (x *xfrmCollector) collectErrors(ch chan<- prometheus.Metric) {
 	stats, err := procfs.NewXfrmStat()
 	if err != nil {
-		log.WithError(err).Error("Error while getting xfrm stats")
+		x.log.Error("Error while getting xfrm stats", logfields.Error, err)
 		return
 	}
 
@@ -122,14 +128,14 @@ func (x *xfrmCollector) collectErrors(ch chan<- prometheus.Metric) {
 }
 
 func (x *xfrmCollector) collectConfigStats(ch chan<- prometheus.Metric) {
-	states, err := netlink.XfrmStateList(netlink.FAMILY_ALL)
+	states, err := safenetlink.XfrmStateList(netlink.FAMILY_ALL)
 	if err != nil {
-		log.WithError(err).Error("Failed to retrieve XFRM states to compute Prometheus metrics")
+		x.log.Error("Failed to retrieve XFRM states to compute Prometheus metrics", logfields.Error, err)
 		return
 	}
 	nbKeys, err := ipsec.CountUniqueIPsecKeys(states)
 	if err != nil {
-		log.WithError(err).Error("Error counting IPsec keys")
+		x.log.Error("Error counting IPsec keys", logfields.Error, err)
 	}
 	ch <- prometheus.MustNewConstMetric(x.nbKeysDesc, prometheus.GaugeValue, float64(nbKeys))
 
@@ -137,9 +143,9 @@ func (x *xfrmCollector) collectConfigStats(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(x.nbXFRMStatesDesc, prometheus.GaugeValue, float64(nbStatesIn), labelDirIn)
 	ch <- prometheus.MustNewConstMetric(x.nbXFRMStatesDesc, prometheus.GaugeValue, float64(nbStatesOut), labelDirOut)
 
-	policies, err := netlink.XfrmPolicyList(netlink.FAMILY_ALL)
+	policies, err := safenetlink.XfrmPolicyList(netlink.FAMILY_ALL)
 	if err != nil {
-		log.WithError(err).Error("Failed to retrieve XFRM policies to compute Prometheus metrics")
+		x.log.Error("Failed to retrieve XFRM policies to compute Prometheus metrics", logfields.Error, err)
 		return
 	}
 	nbPolIn, nbPolOut, nbPolFwd := ipsec.CountXfrmPoliciesByDir(policies)
