@@ -308,7 +308,10 @@ func (d *Daemon) allocateHealthIPs() error {
 			option.Config.IPAM == ipamOption.IPAMENI &&
 			result != nil &&
 			len(result.CIDRs) > 0 {
-			result.CIDRs = coalesceCIDRs(result.CIDRs)
+			result.CIDRs, err = coalesceCIDRs(result.CIDRs)
+			if err != nil {
+				return fmt.Errorf("failed to coalesce CIDRs: %w", err)
+			}
 		}
 
 		log.Debugf("IPv6 health endpoint address: %s", result.IP)
